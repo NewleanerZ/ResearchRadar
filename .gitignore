@@ -16,7 +16,6 @@ pytest-cache-files-*/
 *.egg-info/
 /build/
 /dist/
-logs/
 *.spec
 web/node_modules/
 /web/dist/
