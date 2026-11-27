@@ -55,7 +55,7 @@ from .service import (
     RUN_LABELS, daily_overview, draft_topic, enqueue_backfill, enqueue_daily, find_card, library, open_store,
     report_history, run_history, sample_topics, trend_history,
 )
-from .settings_ui import ENV_PATH, SECRET_SPECS, embedding_diagnostics, mask_secret, save_env_updates, warm_embedding_weights
+from .configuration import ENV_PATH, SECRET_SPECS, embedding_diagnostics, mask_secret, save_env_updates, warm_embedding_weights
 from .sources import catalog_applies
 from .store import Store, norm, work_date
 from .zotero import pull_zotero_collection, push_favorites_to_zotero

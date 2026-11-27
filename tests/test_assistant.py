@@ -1,7 +1,6 @@
 from datetime import timedelta
 from io import BytesIO
 import json
-from pathlib import Path
 
 import httpx
 from pypdf import PdfWriter
@@ -148,7 +147,6 @@ def test_create_and_import_selected_conferences_uses_one_confirmation(radar, mon
     class ReloadedTopic(Topic):
         pass
 
-    # Streamlit may use a reloaded model while retaining the cached store.
     monkeypatch.setattr(conversation, "Topic", ReloadedTopic)
     receipt = confirm_action(store, chat, proposed["id"])
     assert receipt == confirm_action(store, chat, proposed["id"])
@@ -278,31 +276,6 @@ def test_research_resumes_supplements_and_verifies_real_pdf_pages(radar, topic_i
     assert "PDF 第 2 页" in job["markdown"] and "#page=2" in job["markdown"]
     assert "93.5" in job["markdown"] and "伪造的结论" not in job["markdown"]
     assert packet["sha256"] and not store.papers(topic.id)
-
-
-def test_streamlit_conversation_and_restored_history(radar, monkeypatch):
-    from streamlit.testing.v1 import AppTest
-
-    store, topic = radar
-    monkeypatch.setenv("RADAR_DATA_DIR", str(store.directory))
-    chat = new_conversation(store, topic.id)
-    respond(store, chat, "解释点级 AUROC", lambda _request: complete("这是一个点级指标。"))
-    app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "streamlit_app.py"), default_timeout=8)
-    app.query_params["page"] = "assistant"
-    app.run()
-    assert not app.exception and app.chat_input
-    assert any("点级指标" in item.value for item in app.markdown)
-    assert any(item.label == "任务时间线" for item in app.expander)
-    next(button for button in app.button if button.label == "新对话").click().run()
-    assert not app.exception and len(app.selectbox[0].options) == 2
-    memory_page = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "streamlit_app.py"), default_timeout=8)
-    memory_page.query_params["page"] = "topics"
-    memory_page.query_params["edit"] = topic.id
-    memory_page.run()
-    assert any(item.label == "项目记忆" for item in memory_page.expander)
-    next(item for item in memory_page.text_area if item.label == "常用数据集（每行一项）").set_value("Dataset X\nDataset Y")
-    next(button for button in memory_page.button if button.label == "保存项目记忆").click().run()
-    assert not memory_page.exception and project_memory(store, topic.id)[1].datasets == ["Dataset X", "Dataset Y"]
 
 
 def test_research_deadline_and_cancel_keep_private_jobs_separate(radar):

@@ -1,5 +1,6 @@
 .git
 .env
+.env.*
 .venv
 .tools
 .cache
@@ -10,3 +11,9 @@ __pycache__
 pytest-cache-files-*
 tests
 *.egg-info
+/build
+/dist
+/web/dist
+/web/node_modules
+**/*.tsbuildinfo
+**/*.md

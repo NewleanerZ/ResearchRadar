@@ -17,3 +17,19 @@ pytest-cache-files-*/
 /dist/
 *.spec
 web/node_modules/
+/web/dist/
+*.tsbuildinfo
+
+# Keep project documentation local, except for the public README.
+/docs/
+*.md
+*.markdown
+*.mdx
+*.rst
+*.adoc
+*.pdf
+*.doc
+*.docx
+*.odt
+*.rtf
+!/README.md

@@ -15,21 +15,21 @@ services:
   scheduler:
     <<: *radar
     build: .
-  ui:
+  web:
     <<: *radar
     depends_on:
       - scheduler
     command:
       - python
       - -m
-      - streamlit
-      - run
-      - streamlit_app.py
-      - --server.address=0.0.0.0
-      - --server.headless=true
-      - --browser.gatherUsageStats=false
+      - research_radar.cli
+      - serve-api
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
     ports:
-      - "127.0.0.1:8501:8501"
+      - "127.0.0.1:8000:8000"
 
 volumes:
   radar-data:

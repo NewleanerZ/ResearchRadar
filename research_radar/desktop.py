@@ -702,7 +702,7 @@ class RadarPetWindow(QWidget):
             "assistant": ("/assistant", {}),
             "library": ("/workbench", {}),
             "projects": ("/research", {}),
-            "reports": ("/research", {"tab": "trends"}),
+            "reports": ("/trends", {}),
             "settings": ("/settings", {}),
         }
         path, extra = route_map.get(page, ("/briefing", {}))
@@ -735,7 +735,7 @@ class RadarPetWindow(QWidget):
         if time.monotonic() >= self.web_deadline or (self.services.web and self.services.web.poll() is not None):
             self.web_request = None
             self.web_timer.stop()
-            self.drawer.message_lbl.setText("网页启动超时，请检查 Streamlit 依赖后重试")
+            self.drawer.message_lbl.setText("网页启动超时，请检查 FastAPI 服务后重试")
 
     def quit_app(self):
         self.poll_timer.stop()

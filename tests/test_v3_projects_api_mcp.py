@@ -1,6 +1,5 @@
 import asyncio
 import json
-from pathlib import Path
 
 from fastapi.testclient import TestClient
 import httpx
@@ -126,9 +125,11 @@ def test_zotero_sync_fastapi_auth_and_mcp(radar):
     assert "Zotero" in str(res)
 
 
-def test_streamlit_v2_v3_pages_render_without_error(radar, monkeypatch, tmp_path):
-    from research_radar.settings_ui import embedding_diagnostics, mask_secret, save_env_updates
-    from streamlit.testing.v1 import AppTest
+def test_configuration_persistence_and_embedding_diagnostics(radar, monkeypatch, tmp_path):
+    from research_radar.configuration import embedding_diagnostics, mask_secret, save_env_updates
+
+    monkeypatch.delenv("RADAR_LLM_MODEL", raising=False)
+    monkeypatch.delenv("S2_API_KEY", raising=False)
 
     env_file = tmp_path / ".env"
     env_file.write_text("# comment\nRADAR_LLM_MODEL=old\n", encoding="utf-8")
@@ -139,13 +140,6 @@ def test_streamlit_v2_v3_pages_render_without_error(radar, monkeypatch, tmp_path
     save_env_updates(env_file, {}, clear_keys={"S2_API_KEY"})
     assert "S2_API_KEY" not in env_file.read_text(encoding="utf-8")
 
-    store, topic = radar
+    store, _ = radar
     diag = embedding_diagnostics(Settings(data_dir=store.directory))
     assert not diag["ready"] and diag["reasons"]
-    monkeypatch.setenv("RADAR_DATA_DIR", str(store.directory))
-    for page in ("reports", "projects", "library", "settings"):
-        app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "streamlit_app.py"), default_timeout=10)
-        app.query_params["page"] = page
-        app.query_params["topic"] = topic.id
-        app.run()
-        assert not app.exception

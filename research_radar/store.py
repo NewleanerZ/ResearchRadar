@@ -127,7 +127,7 @@ class Store:
         with (self.transaction() if connection is None else nullcontext(connection)) as con:
             active = row(con, "SELECT config FROM topics WHERE id=:key", key=topic.id)
             current = Topic.model_validate_json(active["config"]).model_dump(mode="json") if active else None
-            # Streamlit can reload Topic while an existing Store stays cached.
+            # Accept validated topic configurations from callers outside this module.
             if current != topic.model_dump(mode="json"):
                 raise ValueError("主题刚刚被修改，请重新读取")
             if topic.archived or (automatic and not topic.enabled):

@@ -1,7 +1,6 @@
 from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
 import json
-from pathlib import Path
 import sqlite3
 import time
 
@@ -514,89 +513,3 @@ def test_30_daily_replays_and_delivery(radar):
     assert max_elapsed < 15 * 60
     assert all(row["calls"] == 1 for row in store.all("SELECT json_extract(usage,'$.calls') calls FROM runs"))
     print(f"30 daily replays: succeeded=30/30, duplicate deliveries=0/30, slowest={max_elapsed:.3f}s")
-
-
-def test_streamlit_core_pages(monkeypatch, radar):
-    from streamlit.testing.v1 import AppTest
-
-    store, topic = radar
-    run_daily(store, topic, worker(store, FixtureSources([preprint()], [published()])))
-    monkeypatch.setenv("RADAR_DATA_DIR", str(store.directory))
-    monkeypatch.setenv("RADAR_EXTRA_SOURCES", "crossref,openreview")
-    path = Path("streamlit_app.py").resolve()
-    app = AppTest.from_file(path, default_timeout=15).run()
-    assert not app.exception
-    assert app.title[0].value == "研究概览"
-    assert [metric.label for metric in app.metric] == ["最近一次检索", "最新日报", "重点论文"]
-    next(button for button in app.button if button.label == "查看日报").click().run()
-    assert not app.exception
-    assert app.title[0].value == "日报与趋势"
-    for route, screen in (("topics", "研究主题"), ("library", "论文库"), ("runs", "运行状态")):
-        app.sidebar.radio[0].set_value(route).run()
-        assert not app.exception
-        assert app.title[0].value == screen
-    other = Topic(id="other_topic", name="第二主题", keywords=["benchmark"])
-    store.save_topic(other)
-    linked = AppTest.from_file(path, default_timeout=15)
-    linked.query_params.update({"page": "overview", "topic": other.id})
-    linked.run()
-    assert not linked.exception
-    assert linked.selectbox[0].value == other.id
-    next(button for button in linked.button if button.label == "检索一次").click().run()
-    assert not linked.exception
-    assert store.one("SELECT status FROM runs WHERE topic_id=:id", id=other.id)["status"] == "queued"
-
-    linked.sidebar.radio[0].set_value("library").run()
-    next(widget for widget in linked.date_input if widget.label == "补录开始日期").set_value(DAY - timedelta(days=14))
-    next(widget for widget in linked.date_input if widget.label == "补录结束日期").set_value(DAY - timedelta(days=7))
-    next(button for button in linked.button if button.label == "开始补录").click().run()
-    assert not linked.exception
-    queued = store.one("SELECT kind,status FROM runs WHERE topic_id=:id AND kind LIKE 'backfill-range:%'", id=other.id)
-    assert queued["status"] == "queued" and backfill_dates(queued["kind"]) == (DAY - timedelta(days=14), DAY - timedelta(days=7))
-    assert backfill_catalogs(queued["kind"]) == ("crossref", "openreview")
-    next(button for button in linked.button if button.label == "查看补录进度").click().run()
-    assert not linked.exception
-    assert linked.title[0].value == "运行状态"
-    assert any("按日期补录 2026-11-12 至 2026-11-19" in item.label for item in linked.expander)
-
-
-def test_streamlit_topic_creation_and_management(radar, monkeypatch):
-    from streamlit.testing.v1 import AppTest
-
-    store, _ = radar
-    monkeypatch.setenv("RADAR_DATA_DIR", str(store.directory))
-    suggestion = Topic(id="draft_topic", name="点云检测", description="研究点云缺陷",
-                       keywords=["point cloud defect detection"], proposed_expansions=["3D surface defect detection"])
-    monkeypatch.setattr("research_radar.service.draft_topic", lambda *_: suggestion)
-    app = AppTest.from_file(Path("streamlit_app.py").resolve(), default_timeout=15)
-    app.query_params["page"] = "topics"
-    app.run()
-
-    def click(label):
-        next(button for button in app.button if button.label == label).click().run()
-        assert not app.exception
-        assert not app.error, [message.value for message in app.error]
-
-    click("添加主题")
-    app.text_area(key="new_topic_description").set_value(suggestion.description).run()
-    click("生成检索设置")
-    click("确认添加")
-    created, _ = store.topic(suggestion.id)
-    assert created.enabled and created.keywords == suggestion.keywords
-    assert created.expansions == suggestion.proposed_expansions
-
-    app.button(key=f"follow_{suggestion.id}").click().run()
-    assert not store.topic(suggestion.id)[0].enabled
-    assert store.topic(suggestion.id)[0].query_version() == created.query_version()
-    app.button(key=f"edit_{suggestion.id}").click().run()
-    next(widget for widget in app.text_input if widget.label == "主题名称").set_value("工业点云检测")
-    click("保存修改")
-    assert store.topic(suggestion.id)[0].name == "工业点云检测"
-    app.button(key=f"edit_{suggestion.id}").click().run()
-    click("确认删除主题")
-    assert store.topic(suggestion.id)[0].archived
-    next(widget for widget in app.selectbox if widget.label == "关注状态").set_value("已删除").run()
-    click("恢复主题")
-    restored, _ = store.topic(suggestion.id)
-    assert not restored.archived and not restored.enabled
-    assert restored.query_version() == created.query_version()
