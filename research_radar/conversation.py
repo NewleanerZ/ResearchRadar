@@ -626,14 +626,15 @@ class Conversation:
         if args.topic and scoped_ref and self.topic(args.topic).id != prefix:
             raise ValueError("论文引用与所选主题不一致")
         topic = self.topic(prefix if scoped_ref else args.topic)
-        doi, arxiv_id = normalize_doi(ref), arxiv_identifier(ref)[0]
-        matches = []
-        for item in library(self.store, topic):
-            if scoped_ref and int(ident) == item["paper_id"] or not scoped_ref and any(
-                (doi and record.doi == doi) or (arxiv_id and record.arxiv_id == arxiv_id)
-                or record.title.casefold() == ref.casefold() for record in item["records"]
-            ):
-                matches.append(item)
+        if scoped_ref:
+            matches = library(self.store, topic, paper_id=int(ident))
+        else:
+            doi, arxiv_id = normalize_doi(ref), arxiv_identifier(ref)[0]
+            matches = [
+                item for item in library(self.store, topic)
+                if any((doi and record.doi == doi) or (arxiv_id and record.arxiv_id == arxiv_id)
+                       or record.title.casefold() == ref.casefold() for record in item["records"])
+            ]
         if len(matches) != 1:
             raise ValueError("请从论文列表选一篇，或提供准确 DOI、arXiv ID 和主题")
         return topic, matches[0]

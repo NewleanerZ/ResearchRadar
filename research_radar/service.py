@@ -194,18 +194,21 @@ def refresh_publications(store, settings):
     return {**counts, "errors": failures}
 
 
-def library(store, topic: Topic, query="", after=None, before=None, favorite=False, unread=False, pdf_available=False):
+def library(store, topic: Topic, query="", after=None, before=None, favorite=False, unread=False, pdf_available=False,
+            *, paper_id: int | None = None):
+    papers = store.papers(topic.id, paper_id=paper_id)
+    if not papers:
+        return []
     zone = ZoneInfo(topic.timezone)
-    checks = {
-        item["paper_id"]: item
-        for item in store.all("SELECT paper_id, status, pdf_url, strategy, reason, checked_at FROM paper_pdf_checks")
-    }
-    indexed = {
-        item["paper_id"]: item["source_url"]
-        for item in store.all("SELECT paper_id, source_url FROM paper_documents WHERE status='indexed'")
-    }
+    checks_sql = "SELECT paper_id, status, pdf_url, strategy, reason, checked_at FROM paper_pdf_checks"
+    indexed_sql = "SELECT paper_id, source_url FROM paper_documents WHERE status='indexed'"
+    if paper_id is not None:
+        checks_sql += " WHERE paper_id=:paper_id"
+        indexed_sql += " AND paper_id=:paper_id"
+    checks = {item["paper_id"]: item for item in store.all(checks_sql, paper_id=paper_id)}
+    indexed = {item["paper_id"]: item["source_url"] for item in store.all(indexed_sql, paper_id=paper_id)}
     matches = []
-    for paper in store.papers(topic.id):
+    for paper in papers:
         records = paper["records"]
         when = work_date(records, zone)
         text = norm(" ".join(" ".join([record.title, record.abstract or "", *record.authors]) for record in records))

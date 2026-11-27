@@ -315,8 +315,12 @@ class Store:
         write(con, "UPDATE papers SET merged_into=:keep WHERE id=:old OR merged_into=:old", keep=canonical, old=other)
 
     def papers(self, topic_id: str, corpus_version: str | None = None, discovered_through: str | None = None,
-               discovery_version: str | None = None):
+               discovery_version: str | None = None, *, paper_id: int | None = None):
         filters = ["tp.topic_id=:topic"]
+        if paper_id is not None:
+            if not -(2**63) <= paper_id < 2**63:  # SQLite INTEGER range
+                return []
+            filters.append("tp.paper_id=:paper_id")
         if corpus_version:
             filters.append("""EXISTS (SELECT 1 FROM corpus c WHERE c.topic_id=tp.topic_id AND
                                c.paper_id=tp.paper_id AND c.version=:version)""")
@@ -329,12 +333,12 @@ class Store:
             """SELECT tp.*,p.title,s.record FROM topic_papers tp JOIN papers p ON p.id=tp.paper_id
                JOIN paper_sources s ON s.paper_id=tp.paper_id WHERE """ + " AND ".join(filters)
             + " ORDER BY tp.first_seen DESC, tp.paper_id, s.source,s.external_id",
-            topic=topic_id, version=corpus_version, day=discovered_through, discovery_version=discovery_version,
+            topic=topic_id, paper_id=paper_id, version=corpus_version,
+            day=discovered_through, discovery_version=discovery_version,
             since=str(date.fromisoformat(discovered_through) - timedelta(days=3)) if discovered_through else None,
         ):
-            paper_id = saved["paper_id"]
-            result.setdefault(paper_id, {key: value for key, value in saved.items() if key != "record"})
-            result[paper_id].setdefault("records", []).append(Record.model_validate_json(saved["record"]))
+            paper = result.setdefault(saved["paper_id"], {key: value for key, value in saved.items() if key != "record"})
+            paper.setdefault("records", []).append(Record.model_validate_json(saved["record"]))
         return list(result.values())
 
     def set_reading_state(self, topic_id, paper_id, favorite, is_read, *, connection=None):

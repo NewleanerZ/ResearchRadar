@@ -526,6 +526,13 @@ def create_app(
         return {"events": timeline(db, scope, target, min(200, max(1, limit)))}
 
     # --- Papers, PDF, RAG & Preference ---
+    def topic_paper(topic_id: str, paper_id: int):
+        topic, _ = db.topic(topic_id)
+        papers = library(db, topic, paper_id=paper_id)
+        if not papers:
+            raise HTTPException(status_code=404, detail={"code": "not_found", "message": "找不到论文"})
+        return topic, papers[0]
+
     @app.get("/api/papers", dependencies=[Depends(require_auth)])
     def api_papers(
         topic_id: str,
@@ -599,10 +606,7 @@ def create_app(
 
     @app.get("/api/papers/{paper_id}", dependencies=[Depends(require_auth)])
     def api_paper_detail(paper_id: int, topic_id: str):
-        topic, _ = db.topic(topic_id)
-        match = next((p for p in library(db, topic) if p["paper_id"] == paper_id), None)
-        if not match:
-            raise HTTPException(status_code=404, detail={"code": "not_found", "message": "找不到论文"})
+        _, match = topic_paper(topic_id, paper_id)
         deep = db.one(
             "SELECT level, result_json, evidence_json FROM deep_analyses WHERE topic_id=:t AND paper_id=:p ORDER BY created_at DESC LIMIT 1",
             t=topic_id, p=paper_id,
@@ -659,10 +663,7 @@ def create_app(
             cached_pdf_urls, explore_pdf_sources, mark_pdf_unavailable_if_confirmed, save_pdf_check,
         )
 
-        topic, _ = db.topic(topic_id)
-        match = next((p for p in library(db, topic) if p["paper_id"] == paper_id), None)
-        if not match:
-            raise HTTPException(status_code=404, detail={"code": "not_found", "message": "找不到论文"})
+        _, match = topic_paper(topic_id, paper_id)
         preferred = cached_pdf_urls(db, paper_id)
         with httpx.Client() as client:
             explored = explore_pdf_sources(
@@ -684,10 +685,7 @@ def create_app(
 
     @app.post("/api/papers/{paper_id}/abstract-note", dependencies=[Depends(require_auth)])
     def api_abstract_note(paper_id: int, body: AbstractNotePayload):
-        topic, _ = db.topic(body.topic_id)
-        match = next((p for p in library(db, topic) if p["paper_id"] == paper_id), None)
-        if not match:
-            raise HTTPException(status_code=404, detail={"code": "not_found", "message": "找不到论文"})
+        _, match = topic_paper(body.topic_id, paper_id)
         with httpx.Client() as client:
             return translate_and_summarize_abstract(
                 db, live_settings(), client, paper_id, match["title"], match["records"], force=body.force,
@@ -700,10 +698,7 @@ def create_app(
 
     @app.post("/api/papers/{paper_id}/deep-read", dependencies=[Depends(require_auth)])
     def api_deep_read(paper_id: int, body: DeepReadPayload):
-        topic, _ = db.topic(body.topic_id)
-        match = next((p for p in library(db, topic) if p["paper_id"] == paper_id), None)
-        if not match:
-            raise HTTPException(status_code=404, detail={"code": "not_found", "message": "找不到论文"})
+        topic, match = topic_paper(body.topic_id, paper_id)
         with httpx.Client() as client:
             return deep_read_paper(
                 db, live_settings(), client, topic, paper_id, match["records"],
