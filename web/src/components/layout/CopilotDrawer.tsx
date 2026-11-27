@@ -83,6 +83,10 @@ export function CopilotDrawer() {
               setIsDraft(false)
               setChatId(id)
             }}
+            onNewConversation={() => {
+              setIsDraft(true)
+              setChatId("")
+            }}
           />
         ) : (
           <div className="p-4 text-xs text-[var(--muted-foreground)]">正在准备会话…</div>

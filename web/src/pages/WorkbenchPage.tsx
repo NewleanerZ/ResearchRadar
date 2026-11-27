@@ -229,7 +229,7 @@ export function WorkbenchPage() {
   const card = detail?.card
   const deep = detail?.deep_analysis?.analysis
   const abstractNote = detail?.abstract_note
-  const primaryRecord = detail?.records?.[0]
+  const primaryRecord = detail?.records?.find((r) => Boolean(r.abstract?.trim())) || detail?.records?.[0]
   const total = papersQuery.data?.total || 0
   const totalPages = Math.max(1, Math.ceil(total / limit))
 
@@ -244,11 +244,17 @@ export function WorkbenchPage() {
         <Button
           size="sm"
           variant="ghost"
-          disabled={abstractNoteMut.isPending || !primaryRecord?.abstract}
+          disabled={abstractNoteMut.isPending}
           onClick={() => abstractNoteMut.mutate({ paperId: detail.paper_id, force: Boolean(abstractNote) })}
         >
           <RefreshCw className={cn("h-3 w-3", abstractNoteMut.isPending && "animate-spin")} />
-          {abstractNoteMut.isPending ? "生成中…" : abstractNote ? "重新生成" : "立即生成"}
+          {abstractNoteMut.isPending
+            ? "生成中…"
+            : abstractNote
+              ? "重新生成"
+              : primaryRecord?.abstract
+                ? "立即生成"
+                : "尝试抓取摘要并生成"}
         </Button>
       </div>
       {abstractNote ? (
@@ -263,22 +269,22 @@ export function WorkbenchPage() {
           </div>
         </div>
       ) : abstractNoteMut.isPending ? (
-        <div className="text-[11px] text-[var(--muted-foreground)]">正在调用大模型翻译原文摘要并提炼要点总结…</div>
+        <div className="text-[11px] text-[var(--muted-foreground)]">正在获取摘要并调用大模型翻译与总结…</div>
       ) : abstractNoteErr ? (
         <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-[var(--warning)]">
           <span>{abstractNoteErr}</span>
-          {primaryRecord?.abstract && (
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => abstractNoteMut.mutate({ paperId: detail.paper_id, force: true })}
-            >
-              重试
-            </Button>
-          )}
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => abstractNoteMut.mutate({ paperId: detail.paper_id, force: true })}
+          >
+            重试
+          </Button>
         </div>
       ) : !primaryRecord?.abstract ? (
-        <div className="text-[11px] text-[var(--muted-foreground)]">该论文当前无原文摘要，暂无法生成翻译与总结。</div>
+        <div className="text-[11px] text-[var(--muted-foreground)]">
+          库内源暂未附带摘要，可点击右上角「尝试抓取摘要并生成」从论文主页或开放接口获取摘要后再总结（不下载 PDF）。
+        </div>
       ) : (
         <div className="text-[11px] text-[var(--muted-foreground)]">点击右上角「立即生成」获取基于原文摘要的中文翻译与 AI 总结。</div>
       )}

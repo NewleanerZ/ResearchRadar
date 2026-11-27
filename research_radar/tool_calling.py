@@ -57,13 +57,15 @@ class ModelBudget:
         self.save = save or (lambda: None)
         self.trace = trace or (lambda *_args, **_kwargs: None)
 
-    def complete(self, messages, *, tools=(), structured=False, max_tokens=1400,
-                 thinking_level=None, stream=False, on_delta=None):
+    def complete(self, messages, *, tools=(), structured=False, max_tokens=4096,
+                 thinking_level=None, stream=False, on_delta=None, should_cancel=None):
         if not self.settings.llm_model or not self.settings.llm_key.get_secret_value():
             raise ModelUnavailable("尚未配置对话模型")
+        level = thinking_level or getattr(self.settings, "thinking_level", "off")
+        effective_max_tokens = max(max_tokens, 8192) if (level != "off" and not structured) else max_tokens
         remaining = self.deadline - time.monotonic()
         estimated_input = estimate_tokens([messages, tools])
-        reserved = self.usage.get("tokens", 0) + estimated_input + max_tokens
+        reserved = self.usage.get("tokens", 0) + estimated_input + effective_max_tokens
         reason = ("time" if remaining <= 0 else "calls" if self.usage.get("calls", 0) >= self.calls
                   else "tokens" if reserved > self.tokens else None)
         if reason:
@@ -78,7 +80,6 @@ class ModelBudget:
                           unconfirmed_calls=self.usage.get("unconfirmed_calls", 0) + 1)
         self.save()
         started = time.monotonic()
-        level = thinking_level or getattr(self.settings, "thinking_level", "off")
         self.trace("model", "running", detail={"model": self.settings.llm_model, "call": self.usage["calls"],
                                                "thinking": level})
         response = None
@@ -91,12 +92,12 @@ class ModelBudget:
             try:
                 if stream and not structured:
                     response = stream_completion(
-                        self.client, self.settings, messages, max_tokens, min(40, rem),
-                        tools=tools, thinking_level=level, on_delta=on_delta,
+                        self.client, self.settings, messages, effective_max_tokens, min(60, rem),
+                        tools=tools, thinking_level=level, on_delta=on_delta, should_cancel=should_cancel,
                     )
                 else:
                     response = request_completion(
-                        self.client, self.settings, messages, max_tokens, min(40, rem),
+                        self.client, self.settings, messages, effective_max_tokens, min(60, rem),
                         tools=tools, structured=structured, thinking_level=level,
                     )
                 break

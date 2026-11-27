@@ -700,6 +700,19 @@ export function SettingsPage() {
                     </Button>
                     <Button
                       size="sm"
+                      variant={srv.auto_approve ? "default" : "outline"}
+                      onClick={() =>
+                        apiFetch(`/api/mcp-servers/${srv.id}`, {
+                          method: "PATCH",
+                          body: JSON.stringify({ auto_approve: !srv.auto_approve }),
+                        }).then(() => mcpQuery.refetch())
+                      }
+                      title="开启后，模型调用该 MCP 服务工具将跳过确认卡直接执行"
+                    >
+                      {srv.auto_approve ? "免确认" : "需确认"}
+                    </Button>
+                    <Button
+                      size="sm"
                       variant="outline"
                       onClick={() => apiFetch(`/api/mcp-servers/${srv.id}`, { method: "PATCH", body: JSON.stringify({ enabled: !srv.enabled }) }).then(() => mcpQuery.refetch())}
                     >

@@ -277,8 +277,28 @@ def translate_and_summarize_abstract(
     """Translate a paper's abstract into Chinese and summarize it with an LLM (no PDF download)."""
     primary = best_record({"records": records})
     abstract_text = (primary.abstract or "").strip()
+    existing = store.one(
+        "SELECT cache_key, translation, summary, model, created_at FROM paper_abstract_notes WHERE paper_id=:pid",
+        pid=paper_id,
+    )
     if not abstract_text:
-        return {"available": False, "reason": "该论文当前缺少原文摘要，暂无法生成翻译与总结。"}
+        if not force and existing:
+            return {
+                "available": True,
+                "paper_id": paper_id,
+                "translation": existing["translation"],
+                "summary": existing["summary"],
+                "model": existing.get("model"),
+                "created_at": existing["created_at"],
+                "cached": True,
+            }
+        if client is not None:
+            web_info = fetch_paper_webpage_info(
+                client, settings, title=title, records=records, deadline=time.monotonic() + 10.0,
+            )
+            abstract_text = ((web_info or {}).get("abstract") or (web_info or {}).get("webpage_excerpt") or "").strip()
+    if not abstract_text:
+        return {"available": False, "reason": "尝试抓取论文网页与开放元数据后仍未获取到可用摘要（可能受出版商页面限制）。"}
 
     cache_key = fingerprint([
         ABSTRACT_NOTE_VERSION,
@@ -287,10 +307,6 @@ def translate_and_summarize_abstract(
         abstract_text,
         settings.llm_model or "",
     ])
-    existing = store.one(
-        "SELECT cache_key, translation, summary, model, created_at FROM paper_abstract_notes WHERE paper_id=:pid",
-        pid=paper_id,
-    )
     if not force and existing and existing["cache_key"] == cache_key:
         return {
             "available": True,

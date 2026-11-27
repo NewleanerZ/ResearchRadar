@@ -20,20 +20,27 @@ import httpx
 from pydantic import BaseModel, Field
 
 from .activity import timeline
+from .artifacts import get_artifact, list_artifacts
 from .clustering import (
     CLUSTER_EVENT_LABELS, discover_clusters, enrich_clusters_with_papers, ensure_cluster_snapshots,
     latest_dynamic_clusters,
 )
 from .conversation import (
-    actions, cancel_job, cancel_turn, compact_run, confirm_action, conversations, expire_turn, job_card,
-    new_conversation, queue_turn, research_status, run_turn, submit_turn, turns,
+    actions, cancel_job, cancel_turn, compact_run, confirm_action, conversations, delete_conversation,
+    enqueue_steer, expire_turn, job_card, list_steer_queue, manual_compact, new_conversation,
+    prepare_resume_turn, queue_turn, rename_conversation, research_status, resume_turn, run_turn,
+    submit_turn, turns,
 )
+from .turn_bus import TURN_BUS
 from .deep_read import deep_read_paper, translate_and_summarize_abstract
 from .delivery import retry_notification
 from .events import EVENT_LABELS, list_events, scan_library_events
 from .feedback import record_feedback, reset_preference, set_preference_frozen, topic_preference_profile
 from .gap_workflow import gap_history, run_gap_analysis
-from .mcp_client import add_mcp_server, discover_mcp_tools, list_mcp_servers, remove_mcp_server, set_mcp_server_enabled
+from .mcp_client import (
+    MCP_MANAGER, add_mcp_server, discover_mcp_tools, list_mcp_servers, remove_mcp_server,
+    set_mcp_server_auto_approve, set_mcp_server_enabled,
+)
 from .models import (
     CORE_SOURCES, EXTRA_SOURCES, SOURCE_LABELS, Publication, Settings, Topic, paper_publication,
     publication_label, utc_now,
@@ -67,7 +74,9 @@ LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 NON_SECRET_ENV_KEYS = {
     "RADAR_LLM_BASE_URL", "RADAR_LLM_MODEL", "RADAR_THINKING_LEVEL", "RADAR_STREAM_CHAT",
     "RADAR_LLM_INPUT_PRICE", "RADAR_LLM_OUTPUT_PRICE", "RADAR_KEYWORD_ONLY", "RADAR_RERANKER_ENABLED",
-    "RADAR_RERANKER_MODEL", "RADAR_CHAT_MAX_CALLS", "RADAR_CHAT_MAX_SECONDS", "RADAR_EXTRA_SOURCES",
+    "RADAR_RERANKER_MODEL", "RADAR_CHAT_MAX_CALLS", "RADAR_CHAT_MAX_SECONDS",
+    "RADAR_CHAT_HISTORY_TOKENS", "RADAR_CHAT_TURN_TOKENS", "RADAR_ARTIFACT_INLINE_CHARS",
+    "RADAR_EXTRA_SOURCES",
     "RADAR_CROSSREF_MAILTO", "RADAR_PAGE_LIMIT", "ZOTERO_USER_ID", "RADAR_API_HOST", "RADAR_API_PORT",
     "HF_ENDPOINT",
 }
@@ -164,6 +173,15 @@ class ConversationCreatePayload(BaseModel):
     topic_id: str | None = None
 
 
+class ConversationRenamePayload(BaseModel):
+    title: str = Field(min_length=1, max_length=80)
+
+
+class SteerPayload(BaseModel):
+    prompt: str = Field(min_length=1, max_length=4500)
+    mode: Literal["steer", "follow_up"] = "steer"
+
+
 class ChatPayload(BaseModel):
     prompt: str = Field(min_length=1, max_length=4500)
     conversation_id: str | None = None
@@ -215,10 +233,12 @@ class McpServerCreatePayload(BaseModel):
     command: str
     args: list[str] = Field(default_factory=list)
     env_keys: list[str] = Field(default_factory=list)
+    auto_approve: bool = False
 
 
 class McpServerTogglePayload(BaseModel):
-    enabled: bool
+    enabled: bool | None = None
+    auto_approve: bool | None = None
 
 
 def _error_response(status_code: int, code: str, message: str, *, retryable: bool = False, request_id: str = ""):
@@ -256,6 +276,7 @@ def _serialize_turn(db: Store, turn: dict, jobs_by_turn: dict[str, list[dict]]) 
         "partial_answer": turn.get("partial_answer"),
         "status": turn["status"],
         "events": json.loads(turn.get("events") or "[]"),
+        "usage": json.loads(turn.get("usage") or "{}"),
         "actions": turn_actions,
         "research_jobs": jobs_by_turn.get(turn_id, []),
         "timeline": timeline(db, "chat", turn_id, 100),
@@ -882,6 +903,33 @@ def create_app(
         chat_id = new_conversation(db, body.topic_id)
         return {"id": chat_id}
 
+    @app.patch("/api/conversations/{conversation_id}", dependencies=[Depends(require_auth)])
+    def api_rename_conversation(conversation_id: str, body: ConversationRenamePayload):
+        return rename_conversation(db, conversation_id, body.title)
+
+    @app.delete("/api/conversations/{conversation_id}", dependencies=[Depends(require_auth)])
+    def api_delete_conversation(conversation_id: str):
+        return {"deleted": delete_conversation(db, conversation_id)}
+
+    @app.post("/api/conversations/{conversation_id}/compact", dependencies=[Depends(require_auth)])
+    def api_compact_conversation(conversation_id: str):
+        return manual_compact(db, live_settings(), conversation_id)
+
+    @app.get("/api/conversations/{conversation_id}/artifacts", dependencies=[Depends(require_auth)])
+    def api_list_artifacts(conversation_id: str):
+        return {"artifacts": list_artifacts(db, conversation_id)}
+
+    @app.get("/api/conversations/{conversation_id}/artifacts/{artifact_id}", dependencies=[Depends(require_auth)])
+    def api_get_artifact(conversation_id: str, artifact_id: str):
+        item = get_artifact(db, conversation_id, artifact_id)
+        if not item:
+            raise HTTPException(status_code=404, detail={"code": "not_found", "message": "找不到产物"})
+        return item
+
+    @app.get("/api/conversations/{conversation_id}/steer-queue", dependencies=[Depends(require_auth)])
+    def api_list_steer_queue(conversation_id: str):
+        return {"items": list_steer_queue(db, conversation_id)}
+
     @app.get("/api/conversations/{conversation_id}/turns", dependencies=[Depends(require_auth)])
     def api_list_turns(conversation_id: str):
         jobs_by_turn: dict[str, list[dict]] = {}
@@ -896,30 +944,64 @@ def create_app(
         chat_pool.submit(run_turn, db, current_cfg, turn_id)
         return {"conversation_id": body.conversation_id, "turn_id": turn_id, "status": "queued"}
 
+    @app.post("/api/chat/turns/{turn_id}/steer", dependencies=[Depends(require_auth)])
+    def api_steer_chat_turn(turn_id: str, body: SteerPayload):
+        row = db.one("SELECT conversation_id, status FROM conversation_turns WHERE id=:id", id=turn_id)
+        if not row:
+            raise HTTPException(status_code=404, detail={"code": "not_found", "message": "找不到对话轮次"})
+        current_cfg = live_settings()
+        if row["status"] not in {"queued", "running"}:
+            # Turn already completed; automatically start a follow-up turn if requested.
+            next_id = queue_turn(db, current_cfg, row["conversation_id"], body.prompt, turn_id=uuid4().hex, parent_turn_id=turn_id)
+            chat_pool.submit(run_turn, db, current_cfg, next_id)
+            return {"mode": "immediate_turn", "turn_id": next_id, "conversation_id": row["conversation_id"]}
+        queued = enqueue_steer(db, row["conversation_id"], body.prompt, turn_id=turn_id, mode=body.mode)
+        return queued
+
     @app.get("/api/chat/turns/{turn_id}/stream", dependencies=[Depends(require_auth)])
     async def api_stream_chat_turn(turn_id: str):
         current_cfg = live_settings()
 
-        async def event_generator():
-            last_signature = None
-            while True:
+        def _load_turn_payload():
+            row = db.one("SELECT * FROM conversation_turns WHERE id=:id", id=turn_id)
+            if not row:
+                return None, None
+            if row["status"] == "running":
+                expire_turn(db, current_cfg, turn_id)
                 row = db.one("SELECT * FROM conversation_turns WHERE id=:id", id=turn_id)
+            jobs = [_serialize_job(db, j) for j in research_status(db, conversation_id=row["conversation_id"]) if j["turn_id"] == turn_id]
+            return row, _serialize_turn(db, row, {turn_id: jobs})
+
+        async def event_generator():
+            queue = TURN_BUS.subscribe(turn_id)
+            try:
+                row, payload = _load_turn_payload()
                 if not row:
                     yield f"event: error\ndata: {json.dumps({'message': '找不到对话轮次'}, ensure_ascii=False)}\n\n"
-                    break
-                if row["status"] == "running":
-                    expire_turn(db, current_cfg, turn_id)
-                    row = db.one("SELECT * FROM conversation_turns WHERE id=:id", id=turn_id)
-                jobs = [_serialize_job(db, j) for j in research_status(db, conversation_id=row["conversation_id"]) if j["turn_id"] == turn_id]
-                payload = _serialize_turn(db, row, {turn_id: jobs})
-                signature = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-                if signature != last_signature:
-                    last_signature = signature
-                    event_name = "complete" if row["status"] not in {"queued", "running"} else "update"
-                    yield f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                    return
+                yield f"event: snapshot\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
                 if row["status"] not in {"queued", "running"}:
-                    break
-                await asyncio.sleep(0.25)
+                    yield f"event: complete\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                    return
+                while True:
+                    try:
+                        msg = await asyncio.wait_for(queue.get(), timeout=15.0)
+                        yield f"event: {msg['event']}\ndata: {json.dumps(msg['data'], ensure_ascii=False)}\n\n"
+                        if msg["event"] == "turn_state" and msg["data"].get("status") not in {"queued", "running"}:
+                            _, final_payload = _load_turn_payload()
+                            if final_payload is not None:
+                                yield f"event: complete\ndata: {json.dumps(final_payload, ensure_ascii=False)}\n\n"
+                            break
+                    except asyncio.TimeoutError:
+                        row, payload = _load_turn_payload()
+                        if not row:
+                            break
+                        if row["status"] not in {"queued", "running"}:
+                            yield f"event: complete\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                            break
+                        yield ": keepalive\n\n"
+            finally:
+                TURN_BUS.unsubscribe(turn_id, queue)
 
         return StreamingResponse(
             event_generator(),
@@ -937,8 +1019,19 @@ def create_app(
 
     @app.post("/api/conversations/{conversation_id}/actions/{action_id}/confirm", dependencies=[Depends(require_auth)])
     def api_confirm_action(conversation_id: str, action_id: str, body: ActionConfirmPayload):
-        receipt = confirm_action(db, conversation_id, action_id, approve=body.approve, settings=live_settings())
-        return {"approved": body.approve, "receipt": receipt}
+        current_cfg = live_settings()
+        receipt = confirm_action(db, conversation_id, action_id, approve=body.approve, settings=current_cfg)
+        action_row = db.one("SELECT turn_id FROM conversation_actions WHERE id=:id", id=action_id)
+        resumed = False
+        if action_row and prepare_resume_turn(db, conversation_id, action_row["turn_id"]):
+            chat_pool.submit(resume_turn, db, current_cfg, action_row["turn_id"])
+            resumed = True
+        return {
+            "approved": body.approve,
+            "receipt": receipt,
+            "resumed": resumed,
+            "turn_id": action_row["turn_id"] if action_row else None,
+        }
 
     @app.post("/api/chat", dependencies=[Depends(require_auth)])
     def api_chat(body: ChatPayload):
@@ -1001,6 +1094,9 @@ def create_app(
                 "reranker_model": current_cfg.reranker_model,
                 "chat_max_calls": current_cfg.chat_max_calls,
                 "chat_max_seconds": current_cfg.chat_max_seconds,
+                "chat_history_tokens": current_cfg.chat_history_tokens,
+                "chat_turn_tokens": current_cfg.chat_turn_tokens,
+                "artifact_inline_chars": current_cfg.artifact_inline_chars,
                 "extra_sources": [s.strip() for s in current_cfg.extra_sources.split(",") if s.strip() in EXTRA_SOURCES],
                 "available_extra_sources": [{"id": k, "label": SOURCE_LABELS[k]} for k in EXTRA_SOURCES],
                 "crossref_mailto": current_cfg.crossref_mailto,
@@ -1048,12 +1144,16 @@ def create_app(
 
     @app.post("/api/mcp-servers", dependencies=[Depends(require_auth)])
     def api_add_mcp(body: McpServerCreatePayload):
-        return add_mcp_server(db, body.name, body.command, args=body.args, env_keys=body.env_keys)
+        return add_mcp_server(db, body.name, body.command, args=body.args, env_keys=body.env_keys,
+                              auto_approve=body.auto_approve)
 
     @app.patch("/api/mcp-servers/{server_id}", dependencies=[Depends(require_auth)])
     def api_toggle_mcp(server_id: str, body: McpServerTogglePayload):
-        set_mcp_server_enabled(db, server_id, body.enabled)
-        return {"id": server_id, "enabled": body.enabled}
+        if body.enabled is not None:
+            set_mcp_server_enabled(db, server_id, body.enabled)
+        if body.auto_approve is not None:
+            set_mcp_server_auto_approve(db, server_id, body.auto_approve)
+        return {"id": server_id, "enabled": body.enabled, "auto_approve": body.auto_approve}
 
     @app.delete("/api/mcp-servers/{server_id}", dependencies=[Depends(require_auth)])
     def api_delete_mcp(server_id: str):
@@ -1065,7 +1165,7 @@ def create_app(
         server = next((s for s in list_mcp_servers(db) if s["id"] == server_id), None)
         if not server:
             raise HTTPException(status_code=404, detail={"code": "not_found", "message": "找不到 MCP 服务"})
-        return {"tools": discover_mcp_tools(server)}
+        return {"tools": discover_mcp_tools(server, store=db, refresh=True)}
 
     # --- Static SPA Hosting ---
     if web_dist.is_dir():

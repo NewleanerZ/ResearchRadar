@@ -68,6 +68,7 @@ def parser():
     serve_api = commands.add_parser("serve-api")
     serve_api.add_argument("--host", default=None)
     serve_api.add_argument("--port", type=int, default=None)
+    serve_api.add_argument("--no-worker", action="store_true", help="禁用内置后台任务消费线程")
     commands.add_parser("mcp")
     return cli
 
@@ -209,12 +210,38 @@ def run_command(args, settings):
         from .gap_workflow import run_gap_analysis
         print_json(run_gap_analysis(store, settings, args.topic, project_id=args.project))
     elif cmd == "serve-api":
+        import threading
         import uvicorn
         from .api import create_app
         host = args.host or settings.api_host
         port = args.port or settings.api_port
         runtime_settings = settings.model_copy(update={"api_host": host, "api_port": port})
-        uvicorn.run(create_app(store, runtime_settings), host=host, port=port)
+        stop_worker = threading.Event()
+        worker_thread = None
+        if not args.no_worker:
+            def _worker_loop():
+                bg_worker = Worker(store, runtime_settings)
+                try:
+                    while not stop_worker.is_set():
+                        try:
+                            fresh = Settings.from_env().model_copy(update={"data_dir": store.directory})
+                            bg_worker.settings = fresh
+                            bg_worker.ranker.settings = fresh
+                            bg_worker.tick(schedule=False, notify=False, maintenance=False, research=True)
+                        except Exception as exc:
+                            logging.getLogger(__name__).warning("background worker tick error: %s", type(exc).__name__)
+                        stop_worker.wait(3.0)
+                finally:
+                    bg_worker.client.close()
+
+            worker_thread = threading.Thread(target=_worker_loop, name="radar-api-worker", daemon=True)
+            worker_thread.start()
+        try:
+            uvicorn.run(create_app(store, runtime_settings), host=host, port=port)
+        finally:
+            stop_worker.set()
+            if worker_thread is not None:
+                worker_thread.join(timeout=2.0)
     elif cmd == "mcp":
         from .mcp_server import create_mcp_server
         create_mcp_server(store, settings).run()

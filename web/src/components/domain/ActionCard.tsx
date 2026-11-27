@@ -38,7 +38,7 @@ export function ActionCard({
 }: {
   conversationId: string
   action: { id: string; kind: string; status: string; preview: any; receipt: any }
-  onConfirmed: () => void
+  onConfirmed: (res?: { approved: boolean; resumed?: boolean; turn_id?: string | null }) => void
 }) {
   const [error, setError] = useState("")
   const preview = action.preview || {}
@@ -46,13 +46,16 @@ export function ActionCard({
 
   const confirmMutation = useMutation({
     mutationFn: (approve: boolean) =>
-      apiFetch(`/api/conversations/${conversationId}/actions/${action.id}/confirm`, {
-        method: "POST",
-        body: JSON.stringify({ approve }),
-      }),
-    onSuccess: () => {
+      apiFetch<{ approved: boolean; receipt: any; resumed?: boolean; turn_id?: string | null }>(
+        `/api/conversations/${conversationId}/actions/${action.id}/confirm`,
+        {
+          method: "POST",
+          body: JSON.stringify({ approve }),
+        }
+      ),
+    onSuccess: (res) => {
       setError("")
-      onConfirmed()
+      onConfirmed(res)
     },
     onError: (err: any) => setError(err?.message || "操作失败"),
   })
@@ -94,6 +97,16 @@ export function ActionCard({
         </Badge>
       </div>
       {preview.topic && <div className="mt-1 text-[var(--muted-foreground)]">主题：{preview.topic}</div>}
+      {preview.server && (
+        <div className="mt-1 text-[var(--muted-foreground)]">
+          外部 MCP：{preview.server} · {preview.tool}
+        </div>
+      )}
+      {preview.server && preview.after && (
+        <pre className="mt-1.5 overflow-x-auto rounded border border-[var(--border)] bg-[var(--background)] p-2 font-mono text-[11px]">
+          {JSON.stringify(preview.after, null, 2)}
+        </pre>
+      )}
       {preview.start && (
         <div className="mt-1 text-[var(--muted-foreground)]">
           补录范围：{preview.start} 至 {preview.end} · {(preview.sources || ["arXiv", "OpenAlex"]).join(" / ")}

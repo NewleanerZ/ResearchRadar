@@ -293,7 +293,7 @@ def request_completion(client, settings, messages, max_tokens, timeout, *, struc
 
 
 def stream_completion(client, settings, messages, max_tokens, timeout, *, structured=False, tools=(),
-                      thinking_level="off", on_delta=None):
+                      thinking_level="off", on_delta=None, should_cancel=None):
     """Stream SSE chat completions (with reasoning_content & tool_calls) or fallback cleanly for JSON mocks."""
     endpoint = settings.llm_base_url.rstrip("/") + "/chat/completions"
     payload = _completion_payload(endpoint, settings, messages, max_tokens, structured=structured, tools=tools,
@@ -309,7 +309,10 @@ def stream_completion(client, settings, messages, max_tokens, timeout, *, struct
         reasoning_parts: list[str] = []
         tool_calls_map: dict[int, dict] = {}
         usage: dict = {}
+        finish_reason: str | None = None
         for line in response.iter_lines():
+            if should_cancel and should_cancel():
+                break
             if not line or not line.startswith("data:"):
                 continue
             raw = line[5:].strip()
@@ -321,6 +324,8 @@ def stream_completion(client, settings, messages, max_tokens, timeout, *, struct
             choices = chunk.get("choices") or []
             if not choices:
                 continue
+            if choices[0].get("finish_reason"):
+                finish_reason = choices[0]["finish_reason"]
             delta = choices[0].get("delta") or {}
             if r_delta := delta.get("reasoning_content"):
                 reasoning_parts.append(r_delta)
@@ -349,7 +354,7 @@ def stream_completion(client, settings, messages, max_tokens, timeout, *, struct
             message["reasoning_content"] = "".join(reasoning_parts)
         if tool_calls_map:
             message["tool_calls"] = [tool_calls_map[i] for i in sorted(tool_calls_map)]
-        return {"choices": [{"message": message}], "usage": usage}
+        return {"choices": [{"message": message, "finish_reason": finish_reason}], "usage": usage}
 
 
 def request_json_completion(client, settings, messages, max_tokens, timeout):

@@ -1,9 +1,11 @@
 """Conversation tools, local history, and confirmation receipts."""
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 import json
 import logging
 import re
+import threading
 import time
 from typing import Literal
 from urllib.parse import unquote
@@ -14,24 +16,28 @@ import httpx
 from pydantic import Field, model_validator
 
 from .activity import event_sink, log_event
+from .artifacts import maybe_offload_tool_output, read_artifact_slice
+from .context_engine import build_context_messages, compact_history_structured
 from .deep_read import deep_read_paper
 from .delivery import retry_notification
 from .events import list_events
 from .gap_workflow import run_gap_analysis
-from .mcp_client import call_external_mcp_tool, discover_mcp_tools, list_mcp_servers
-from .models import CORE_SOURCES, SOURCE_LABELS, Topic, TopicDraft, backfill_venues, dump, paper_publication, publication_label, utc_now, venue_matches
+from .mcp_client import call_external_mcp_tool, discover_mcp_tools, list_mcp_servers, native_mcp_registry
+from .models import CORE_SOURCES, SOURCE_LABELS, Settings, Topic, TopicDraft, backfill_venues, dump, paper_publication, publication_label, utc_now, venue_matches
 from .pdf_explorer import (
     cached_pdf_urls, explore_pdf_sources, fetch_paper_webpage_info, mark_pdf_unavailable_if_confirmed, save_pdf_check,
 )
 from .projects import ProjectInput, create_project, link_project_papers, list_projects, protocol_comparison_matrix
 from .rag import hybrid_search, index_chunk_records
 from .ranking import best_record, request_completion
+from .subagent import run_subagent_batch
+from .turn_bus import TURN_BUS
 from .zotero import pull_zotero_collection, push_favorites_to_zotero
 from .project_memory import ProjectMemory, memory_snapshot
 from .research_control import ResearchAdjustment, cancel_pending_adjustments, queue_adjustment
 from .service import backfill_kind, find_card, library, make_topic_draft, report_history, run_history, trend_history
 from .sources import SourceError, Sources, arxiv_identifier, catalog_applies, normalize_doi
-from .store import norm, row, work_date, write
+from .store import norm, row, rows, work_date, write
 from .tool_calling import Arguments, BudgetExceeded, ModelBudget, ModelUnavailable, Tool, estimate_tokens, execute_tool, model_message, result, tool_message
 
 logger = logging.getLogger(__name__)
@@ -197,6 +203,24 @@ class McpCallArg(Arguments):
     arguments: dict = Field(default_factory=dict)
 
 
+class ReadArtifactArg(Arguments):
+    artifact_id: str = Field(min_length=1, max_length=40)
+    offset: int = Field(default=0, ge=0)
+    limit: int = Field(default=3000, ge=200, le=6000)
+    query: str = Field("", max_length=200)
+
+
+class SubagentTask(Arguments):
+    role: str = Field(min_length=1, max_length=80)
+    goal: str = Field(min_length=1, max_length=1200)
+    paper_refs: list[str] = Field(default_factory=list, max_length=8)
+    query: str = Field("", max_length=240)
+
+
+class RunSubagentArg(Arguments):
+    tasks: list[SubagentTask] = Field(min_length=1, max_length=5)
+
+
 TOOLS = {
     "list_topics": Tool("列出主题和关注状态，返回真实主题 ID。", ListTopics),
     "search_library": Tool("查已收录论文，query 使用作者或学术英文关键词（可省略），支持 venues 顶会过滤和按 date/citations 排序。", SearchLibrary),
@@ -227,6 +251,11 @@ TOOLS = {
     "run_gap_analysis": Tool("运行带外部反向查证的 Research Gap 研究空白分析与实验方案建议。", GapArg),
     "list_external_mcp": Tool("列出已挂载启用的外部 MCP 工具服务与工具清单。", Arguments),
     "call_external_mcp": Tool("调用已启用的外部 MCP 服务工具。", McpCallArg),
+    "read_artifact": Tool("分段或按关键词读取当前会话中已落盘的长工具产物（完整检索列表、PDF 原文页或研究报告）。", ReadArtifactArg),
+    "run_subagent": Tool(
+        "派发 1–5 个独立短上下文的只读科研子代理并发查证（适合多篇论文对照核查、批量文献筛选与证据抽取，避免主对话上下文膨胀）。",
+        RunSubagentArg,
+    ),
     "set_paper_state": Tool("按用户明确指令设置某一篇论文的收藏或阅读状态。", PaperState),
     "enqueue_daily": Tool("按用户明确请求提交一个主题的今日检索。", TopicArg),
     "draft_topic": Tool("直接传入生成好的主题配置草案。使用 1–6 个具体英文检索短语，不会保存主题。", DraftArg),
@@ -245,13 +274,18 @@ READ_TOOLS = {
     "list_topics", "search_library", "search_external_papers", "rag_search",
     "fetch_paper_summary", "fetch_paper_pdf", "get_paper", "get_report",
     "get_trend", "get_run", "get_project_memory", "list_projects", "compare_methods", "list_research_events",
-    "list_external_mcp",
+    "list_external_mcp", "read_artifact", "run_subagent",
 }
+SUBAGENT_READ_TOOLS = (
+    "search_library", "search_external_papers", "rag_search",
+    "fetch_paper_summary", "fetch_paper_pdf", "get_paper", "get_project_memory", "read_artifact",
+)
 ACTION_LABELS = {
     "create_topic": "创建主题", "edit_topic": "修改主题", "follow": "关注主题", "unfollow": "取消关注",
     "archive": "删除主题", "restore": "恢复主题", "confirm_expansions": "确认补充检索词",
     "backfill": "历史入库", "retry_run": "重试任务", "retry_notification": "重发飞书通知",
     "create_project": "创建科研项目档案", "sync_zotero": "同步 Zotero 文献库",
+    "mcp_call": "调用外部 MCP 工具",
 }
 SYSTEM = (
     "你是 ResearchRadar 科研助手，用中文回应。一般问题可以直接回答。涉及项目数据必须调用工具，"
@@ -273,15 +307,105 @@ SYSTEM = (
     "project_memory 是已保存的主题口径，本轮明确要求优先。"
     "用户明确调整正在运行的专题时用 steer_research，不重复创建专题。"
     "需要确认的动作只提交预览。操作成功以回执为准。任务已排队时简短告诉用户进度可在任务卡查看。"
+    "当工具返回 artifact_id 时，可用 read_artifact 按偏移或关键词读取完整原文与更多列表项。"
     "论文列表按工具给定顺序呈现，避免重排编号或生成未经核对的链接。"
 )
 
 
 def new_conversation(store, topic_id=None):
     key, now = uuid4().hex, utc_now().isoformat()
-    store.execute("INSERT INTO conversations VALUES (:id,'新对话',:context,:now,:now)",
+    store.execute("INSERT INTO conversations(id,title,context,created_at,opened_at) VALUES (:id,'新对话',:context,:now,:now)",
                   id=key, context=dump({"topic": topic_id} if topic_id else {}), now=now)
     return key
+
+
+def rename_conversation(store, conversation_id: str, title: str) -> dict:
+    clean = " ".join(title.split())[:60]
+    if not clean:
+        raise ValueError("会话标题不能为空")
+    updated = store.execute("UPDATE conversations SET title=:title WHERE id=:id", title=clean, id=conversation_id)
+    if not updated:
+        raise ValueError("找不到会话")
+    return {"id": conversation_id, "title": clean}
+
+
+def delete_conversation(store, conversation_id: str) -> bool:
+    with store.transaction() as con:
+        active = row(con, "SELECT 1 FROM conversation_turns WHERE conversation_id=:id AND status IN ('queued','running')",
+                     id=conversation_id)
+        if active:
+            raise ValueError("当前会话还有任务正在运行，请先停止后再删除")
+        turn_ids = [r["id"] for r in rows(con, "SELECT id FROM conversation_turns WHERE conversation_id=:id", id=conversation_id)]
+        if turn_ids:
+            placeholders = ",".join(f":t{i}" for i in range(len(turn_ids)))
+            params = {f"t{i}": tid for i, tid in enumerate(turn_ids)}
+            write(con, f"DELETE FROM conversation_actions WHERE turn_id IN ({placeholders})", **params)
+            write(con, f"DELETE FROM research_adjustments WHERE job_id IN (SELECT id FROM research_jobs WHERE turn_id IN ({placeholders}))", **params)
+            write(con, f"DELETE FROM research_jobs WHERE turn_id IN ({placeholders})", **params)
+        write(con, "DELETE FROM conversation_turns WHERE conversation_id=:id", id=conversation_id)
+        res = write(con, "DELETE FROM conversations WHERE id=:id", id=conversation_id)
+        return bool(res.rowcount)
+
+
+def enqueue_steer(store, conversation_id: str, prompt: str, *, turn_id: str | None = None, mode: str = "steer") -> dict:
+    clean = prompt.strip()
+    if not 1 <= len(clean) <= 4500:
+        raise ValueError("请输入 1 至 4500 字")
+    if mode not in {"steer", "follow_up"}:
+        raise ValueError("不支持的排队模式")
+    if not store.one("SELECT 1 FROM conversations WHERE id=:id", id=conversation_id):
+        raise ValueError("找不到会话")
+    sid = uuid4().hex
+    now = utc_now().isoformat()
+    store.execute(
+        """INSERT INTO conversation_steer_queue(id, conversation_id, turn_id, mode, prompt, status, created_at)
+           VALUES (:id, :cid, :tid, :mode, :prompt, 'pending', :now)""",
+        id=sid, cid=conversation_id, tid=turn_id, mode=mode, prompt=clean, now=now,
+    )
+    item = {"id": sid, "conversation_id": conversation_id, "turn_id": turn_id, "mode": mode, "prompt": clean,
+            "status": "pending", "created_at": now}
+    if turn_id and mode == "steer":
+        TURN_BUS.publish(turn_id, "steer_queued", item)
+    return item
+
+
+def pop_pending_steers(store, conversation_id: str, turn_id: str) -> list[dict]:
+    with store.transaction() as con:
+        items = rows(
+            con,
+            """SELECT id, prompt, created_at FROM conversation_steer_queue
+               WHERE conversation_id=:cid AND mode='steer' AND status='pending'
+               AND (turn_id IS NULL OR turn_id=:tid) ORDER BY rowid""",
+            cid=conversation_id, tid=turn_id,
+        )
+        if items:
+            ids = ",".join(f":s{i}" for i in range(len(items)))
+            write(con, f"UPDATE conversation_steer_queue SET status='injected' WHERE id IN ({ids})",
+                  **{f"s{i}": item["id"] for i, item in enumerate(items)})
+        return items
+
+
+def pop_next_followup(store, conversation_id: str) -> dict | None:
+    with store.transaction() as con:
+        nxt = row(
+            con,
+            """SELECT id, prompt, created_at FROM conversation_steer_queue
+               WHERE conversation_id=:cid AND mode='follow_up' AND status='pending'
+               ORDER BY rowid LIMIT 1""",
+            cid=conversation_id,
+        )
+        if not nxt:
+            return None
+        write(con, "UPDATE conversation_steer_queue SET status='consumed' WHERE id=:id", id=nxt["id"])
+        return nxt
+
+
+def list_steer_queue(store, conversation_id: str) -> list[dict]:
+    return store.all(
+        """SELECT id, turn_id, mode, prompt, status, created_at FROM conversation_steer_queue
+           WHERE conversation_id=:cid AND status='pending' ORDER BY rowid""",
+        cid=conversation_id,
+    )
 
 
 def conversations(store, *, include_empty: bool = False):
@@ -290,8 +414,13 @@ def conversations(store, *, include_empty: bool = False):
 
 
 def turns(store, conversation_id):
-    return store.all("SELECT * FROM conversation_turns WHERE conversation_id=:id ORDER BY rowid",
-                     id=conversation_id)
+    return store.all(
+        """SELECT t.*, r.state_json, r.messages_json, r.parent_turn_id
+           FROM conversation_turns t
+           LEFT JOIN conversation_turn_runtime r ON r.turn_id = t.id
+           WHERE t.conversation_id=:id ORDER BY t.rowid""",
+        id=conversation_id,
+    )
 
 
 def actions(store, turn_id):
@@ -371,60 +500,25 @@ def paper_instruction(prompt, action):
     return next((clause for clause in instructions(prompt) if any(re.search(pattern, clause) for pattern in patterns)), None)
 
 
-def compact_history(history, context, settings, client=None):
-    """Compact older conversation turns into a concise checkpoint summary when context grows."""
-    if len(history) <= 4:
-        return
-    older = [t for t in history[:-4] if t["status"] in {"done", "partial"} and t["answer"]]
-    if not older or context.get("compacted_count", 0) >= len(older):
-        return
-    bullets = []
-    for turn in older[-12:]:
-        tools_used = [ev.get("name") for ev in json.loads(turn.get("events") or "[]") if ev.get("name")]
-        tag = f"[工具:{','.join(dict.fromkeys(tools_used))}] " if tools_used else ""
-        bullets.append(f"- 问：{turn['prompt'][:140]} | {tag}答：{turn['answer'][:180]}")
-    summary = "\n".join(bullets)
-    if settings.llm_model and settings.llm_key.get_secret_value() and client is not None and len(older) >= 4:
-        try:
-            reply = request_completion(
-                client, settings,
-                [
-                    {"role": "system", "content": "将以下历史科研对话压缩为 300 字以内的中文要点，保留主题 ID、论文标题/编号、项目名和关键结论。"},
-                    {"role": "user", "content": summary[:6000]},
-                ],
-                max_tokens=450, timeout=8.0, thinking_level="off",
-            )
-            llm_text = (reply["choices"][0]["message"].get("content") or "").strip()
-            if llm_text:
-                summary = llm_text
-        except Exception:
-            pass
-    context["compacted_summary"] = summary[:2400]
-    context["compacted_count"] = len(older)
+def compact_history(history, context, settings, client=None, *, store=None, conversation_id=None, force=False):
+    """Compact older conversation turns into a structured checkpoint summary when context grows."""
+    return compact_history_structured(
+        history,
+        context,
+        settings,
+        client=client,
+        store=store,
+        conversation_id=conversation_id,
+        force=force,
+    )
 
 
-def recent_messages(history, context, prompt):
-    facts = {key: value for key, value in context.items()
-             if key in {"topic", "papers", "paper_lists", "paper", "run", "research", "draft", "local_date", "timezone",
-                        "project_memory", "compacted_summary", "latest_research_report"}}
-    tail = []
-    for turn in history[-4:]:
-        if turn["status"] in {"done", "partial"} and turn["answer"]:
-            events = json.loads(turn.get("events") or "[]")
-            tool_note = ""
-            if events:
-                names = list(dict.fromkeys(ev.get("name", "") for ev in events if ev.get("name")))
-                tool_note = f"\n[已调用工具: {', '.join(names)}]"
-            tail.extend([{"role": "user", "content": turn["prompt"][:2000]},
-                         {"role": "assistant", "content": (turn["answer"][:1600] + tool_note)[:1800]}])
-    current = {"role": "user", "content": dump({"user_message": prompt, "app_context": facts})}
-    while tail and len(dump([*tail, current]).encode("utf-8")) > 13000:
-        del tail[:2]
-    return [{"role": "system", "content": SYSTEM}, *tail, current]
+def recent_messages(history, context, prompt, *, token_budget=48000):
+    return build_context_messages(SYSTEM, history, context, prompt, token_budget=token_budget)
 
 
 class Conversation:
-    def __init__(self, store, settings, client, conversation_id, turn_id, prompt, context, progress):
+    def __init__(self, store, settings, client, conversation_id, turn_id, prompt, context, progress, *, bus=None, usage=None):
         self.store, self.settings, self.client = store, settings, client
         self.conversation_id, self.turn_id, self.prompt = conversation_id, turn_id, prompt
         self.context = context
@@ -432,18 +526,27 @@ class Conversation:
         self.result_lists = []
         self.events = []
         self.progress = progress
+        self.bus = bus or TURN_BUS
         self.trace = event_sink(store, "chat", turn_id)
         self.memories = {}
-        self.budget = ModelBudget(client, settings, settings.chat_max_seconds, settings.chat_max_calls, 180000,
-                                  save=self.save_usage, trace=self.trace)
+        self.final_reasoning = None
+        self.last_messages = []
+        self.suspended = None
+        self._ctx_lock = threading.Lock()
+        turn_tokens = getattr(settings, "chat_turn_tokens", 120000)
+        self.budget = ModelBudget(client, settings, settings.chat_max_seconds, settings.chat_max_calls,
+                                  max(180000, turn_tokens * 2), usage=usage, save=self.save_usage, trace=self.trace)
 
     def memory(self, topic_id):
-        if topic_id and topic_id not in self.memories:
-            snapshot = memory_snapshot(self.store, topic_id)
-            self.memories[topic_id] = snapshot
-            if snapshot["revision"]:
-                self.trace("project_memory", "loaded", detail={"topic_id": topic_id, "revision": snapshot["revision"]})
-        return self.memories.get(topic_id)
+        if not topic_id:
+            return None
+        with self._ctx_lock:
+            if topic_id not in self.memories:
+                snapshot = memory_snapshot(self.store, topic_id)
+                self.memories[topic_id] = snapshot
+                if snapshot["revision"]:
+                    self.trace("project_memory", "loaded", detail={"topic_id": topic_id, "revision": snapshot["revision"]})
+            return self.memories.get(topic_id)
 
     def save_usage(self):
         self.store.execute("UPDATE conversation_turns SET usage=:usage WHERE id=:id",
@@ -470,10 +573,11 @@ class Conversation:
         listed = [{"reference": card["reference"], "title": card["title"][:180]} for card in cards]
         if not listed:
             return
-        self.result_lists.append(listed)
-        self.context.update(papers=listed, paper_lists=self.result_lists[-4:])
-        if len(listed) == 1:
-            self.context["paper"] = listed[0]["reference"]
+        with self._ctx_lock:
+            self.result_lists.append(listed)
+            self.context.update(papers=listed, paper_lists=self.result_lists[-4:])
+            if len(listed) == 1:
+                self.context["paper"] = listed[0]["reference"]
 
     def indexed_paper(self, number, topic_id=None):
         lists = self.visible.get("paper_lists") or [self.visible.get("papers", [])]
@@ -589,53 +693,75 @@ class Conversation:
             search_topic = Topic(id="external_search", name=terms[0], description=terms[0],
                                  keywords=terms, categories=cats, timezone=tz_name)
             deadline = time.monotonic() + 25.0
-            groups: list[list] = []
-            seen: dict[str, int] = {}
+            active_sources = []
             for src in selected:
-                if time.monotonic() >= deadline - 0.5:
-                    coverage[src] = {"status": "skipped", "reason": "time_budget"}
-                    continue
                 if not catalog_applies(src, search_topic, terms):
                     coverage[src] = {"status": "skipped", "reason": "topic_mismatch"}
-                    continue
+                else:
+                    active_sources.append(src)
+
+            max_pages = 2 if venues else 1
+            limit = 50 if venues else max(25, args.limit * 2)
+
+            def _fetch_src(src: str):
+                if time.monotonic() >= deadline - 0.5:
+                    return src, {"status": "skipped", "reason": "time_budget"}, []
                 cursor = None
                 fetched = 0
                 matched_in_src = 0
-                max_pages = 2 if venues else 1
-                limit = 50 if venues else max(25, args.limit * 2)
+                recs = []
                 try:
-                    for _ in range(max_pages):
-                        page = sources.page(
-                            src, search_topic, terms, after, end, cursor, deadline,
-                            limit=limit, newest=(args.sort_by == "date"),
-                            sort="citations" if args.sort_by == "citations" else None,
-                        )
-                        fetched += len(page.records)
-                        for record in page.records:
-                            if venues and venue_matches(record.publication, venues):
-                                matched_in_src += 1
-                            doi = normalize_doi(record.doi)
-                            keys = []
-                            if doi:
-                                keys.append(f"doi:{doi}")
-                            if record.arxiv_id:
-                                keys.append(f"arxiv:{record.arxiv_id}")
-                            title_key = norm(record.title)
-                            if title_key:
-                                keys.append(f"title:{title_key}")
-                            idx = next((seen[key] for key in keys if key in seen), None)
-                            if idx is None:
-                                idx = len(groups)
-                                groups.append([])
-                            groups[idx].append(record)
-                            for key in keys:
-                                seen[key] = idx
-                        cursor = page.cursor
-                        if not cursor or (venues and matched_in_src >= args.limit * 2) or time.monotonic() >= deadline - 1.5:
-                            break
-                    coverage[src] = {"status": "ok", "fetched": fetched}
+                    with httpx.Client() as worker_client:
+                        src_adapter = Sources.configured(worker_client, self.settings)
+                        for _ in range(max_pages):
+                            page = src_adapter.page(
+                                src, search_topic, terms, after, end, cursor, deadline,
+                                limit=limit, newest=(args.sort_by == "date"),
+                                sort="citations" if args.sort_by == "citations" else None,
+                            )
+                            fetched += len(page.records)
+                            for record in page.records:
+                                if venues and venue_matches(record.publication, venues):
+                                    matched_in_src += 1
+                                recs.append(record)
+                            cursor = page.cursor
+                            if not cursor or (venues and matched_in_src >= args.limit * 2) or time.monotonic() >= deadline - 1.5:
+                                break
+                    return src, {"status": "ok", "fetched": fetched}, recs
                 except SourceError as err:
-                    coverage[src] = {"status": "error", "error": str(err)}
+                    return src, {"status": "error", "error": str(err)}, recs
+
+            fetched_by_src: dict[str, list] = {}
+            if len(active_sources) > 1:
+                with ThreadPoolExecutor(max_workers=min(6, len(active_sources)), thread_name_prefix="radar-ext") as epool:
+                    for src, cov, recs in epool.map(_fetch_src, active_sources):
+                        coverage[src] = cov
+                        fetched_by_src[src] = recs
+            elif len(active_sources) == 1:
+                src, cov, recs = _fetch_src(active_sources[0])
+                coverage[src] = cov
+                fetched_by_src[src] = recs
+
+            groups: list[list] = []
+            seen: dict[str, int] = {}
+            for src in active_sources:
+                for record in fetched_by_src.get(src, ()):
+                    doi = normalize_doi(record.doi)
+                    keys = []
+                    if doi:
+                        keys.append(f"doi:{doi}")
+                    if record.arxiv_id:
+                        keys.append(f"arxiv:{record.arxiv_id}")
+                    title_key = norm(record.title)
+                    if title_key:
+                        keys.append(f"title:{title_key}")
+                    idx = next((seen[key] for key in keys if key in seen), None)
+                    if idx is None:
+                        idx = len(groups)
+                        groups.append([])
+                    groups[idx].append(record)
+                    for key in keys:
+                        seen[key] = idx
         entries = []
         for order, group in enumerate(groups):
             pub = paper_publication(group)
@@ -690,7 +816,7 @@ class Conversation:
             {"title": card["title"][:180], "url": card["url"], "doi": card["doi"], "arxiv_id": card["arxiv_id"]}
             for card in cards
         ]
-        return {
+        payload = {
             "total": len(entries),
             "after": after.isoformat(),
             "before": before.isoformat(),
@@ -699,6 +825,17 @@ class Conversation:
             "coverage": coverage,
             "papers": cards,
         }
+        compact, _ = maybe_offload_tool_output(
+            self.store,
+            self.conversation_id,
+            self.turn_id,
+            "search_external_papers",
+            f"外部检索：{' / '.join(terms[:3])}",
+            payload,
+            inline_chars=getattr(self.settings, "artifact_inline_chars", 2400),
+            summary_builder=lambda data: {**data, "papers": data["papers"][:5]},
+        )
+        return compact
 
     def _resolve_paper_hints(self, args):
         local_topic, local_item = None, None
@@ -798,21 +935,40 @@ class Conversation:
             ),
             reverse=True,
         )
+        full_pages = [
+            {"page": page_no, "text": text[:4000]}
+            for page_no, text in sorted(ranked[:8], key=lambda item: item[0])
+        ]
         selected_pages = [
             {"page": page_no, "text": text[:1600]}
             for page_no, text in sorted(ranked[:5], key=lambda item: item[0])
         ]
-        return {
+        paper_title = title or (best_record(local_item).title if local_item else "")
+        full_payload = {
             "found": True,
-            "title": title or (best_record(local_item).title if local_item else ""),
+            "title": paper_title,
             "pdf_url": explored["pdf_url"],
             "strategy": explored["strategy"],
             "page_count": explored["page_count"],
             "indexed": indexed_info,
             "stored_raw_pdf": False,
             "attempts": explored.get("attempts", []),
-            "pages": selected_pages,
+            "pages": full_pages,
         }
+        compact, _ = maybe_offload_tool_output(
+            self.store,
+            self.conversation_id,
+            self.turn_id,
+            "fetch_paper_pdf",
+            f"PDF 全文：{paper_title[:80]}",
+            full_payload,
+            inline_chars=getattr(self.settings, "artifact_inline_chars", 2400),
+            summary_builder=lambda data: {
+                **data,
+                "pages": [{"page": p["page"], "text": p["text"][:600]} for p in selected_pages[:2]],
+            },
+        )
+        return compact
 
     def read(self, name, args):
         if name == "get_project_memory":
@@ -908,7 +1064,82 @@ class Conversation:
             if topic_id:
                 self.context["topic"] = topic_id
             hits = hybrid_search(self.store, self.settings, args.query, topic_id=topic_id, limit=args.limit)
-            return result({"query": args.query, "total": len(hits), "chunks": hits})
+            payload = {"query": args.query, "total": len(hits), "chunks": hits}
+            compact, _ = maybe_offload_tool_output(
+                self.store,
+                self.conversation_id,
+                self.turn_id,
+                "rag_search",
+                f"全文检索：{args.query[:80]}",
+                payload,
+                inline_chars=getattr(self.settings, "artifact_inline_chars", 2400),
+                summary_builder=lambda data: {**data, "chunks": data["chunks"][:3]},
+            )
+            return result(compact)
+        if name == "read_artifact":
+            return result(read_artifact_slice(
+                self.store,
+                self.conversation_id,
+                args.artifact_id,
+                offset=args.offset,
+                limit=args.limit,
+                query=args.query,
+            ))
+        if name == "run_subagent":
+            sub_registry = {k: TOOLS[k] for k in SUBAGENT_READ_TOOLS}
+            sub_defs = [sub_registry[k].definition(k) for k in SUBAGENT_READ_TOOLS]
+            topic_id = self.context.get("topic")
+            proj_mem = self.memory(topic_id) if topic_id else None
+            base_ctx = dict(self.context)
+
+            def _dispatcher_factory(sub_client):
+                sub_conv = Conversation(
+                    self.store,
+                    self.settings,
+                    sub_client,
+                    self.conversation_id,
+                    self.turn_id,
+                    self.prompt,
+                    dict(base_ctx),
+                    lambda _name: None,
+                    bus=self.bus,
+                )
+                return sub_conv.dispatch
+
+            outcomes = run_subagent_batch(
+                self.store,
+                self.settings,
+                self.client,
+                conversation_id=self.conversation_id,
+                turn_id=self.turn_id,
+                user_prompt=self.prompt,
+                tasks=[t.model_dump() for t in args.tasks],
+                topic_id=topic_id,
+                project_memory=proj_mem,
+                deadline=self.budget.deadline,
+                tool_definitions=sub_defs,
+                tool_registry=sub_registry,
+                dispatcher_factory=_dispatcher_factory,
+                bus=self.bus,
+            )
+            payload = {"count": len(outcomes), "results": outcomes}
+            compact, _ = maybe_offload_tool_output(
+                self.store,
+                self.conversation_id,
+                self.turn_id,
+                "run_subagent",
+                f"子代理汇总（{len(outcomes)} 项）",
+                payload,
+                inline_chars=getattr(self.settings, "artifact_inline_chars", 2400),
+                summary_builder=lambda data: {
+                    "count": data["count"],
+                    "results": [
+                        {k: item.get(k) for k in ("subagent_id", "role", "status", "summary", "evidence_refs", "gaps")}
+                        for item in data["results"]
+                    ],
+                },
+            )
+            return result(compact)
         if name == "list_projects":
             topic_id = self.topic(args.topic).id if (args.topic or self.context.get("topic")) else ""
             return result(list_projects(self.store, topic_id))
@@ -1095,7 +1326,20 @@ class Conversation:
                 self.store, self.settings, topic.id, project_id=args.project_id, client=self.client,
                 deadline=min(self.budget.deadline, time.monotonic() + 45),
             )
-            return result({"id": gap["id"], "status": gap["status"], "markdown": (gap["markdown"] or "")[:3500]})
+            full_md = gap["markdown"] or ""
+            payload = {"id": gap["id"], "status": gap["status"], "markdown": full_md}
+            compact, _ = maybe_offload_tool_output(
+                self.store,
+                self.conversation_id,
+                self.turn_id,
+                "run_gap_analysis",
+                f"Research Gap 分析：{topic.name}",
+                payload,
+                inline_chars=max(3500, getattr(self.settings, "artifact_inline_chars", 2400)),
+                mime_type="text/markdown",
+                summary_builder=lambda data: {**data, "markdown": full_md[:1800]},
+            )
+            return result(compact)
         if name == "call_external_mcp":
             return result(call_external_mcp_tool(self.store, args.server, args.tool, args.arguments))
         if name == "propose_action":
@@ -1225,40 +1469,56 @@ class Conversation:
             raise ValueError("请明确要取消的专题任务")
         return result(cancel_job(self.store, self.conversation_id, key))
 
-    def respond(self, messages):
-        permitted = dict(TOOLS)
-        # Keep direct-mutating tools gated on explicit user phrasing; confirmation-gated tools remain available.
-        if not explicit(self.prompt, r"收藏|已读|未读|读完|favorite|bookmark|mark read"):
-            permitted.pop("set_paper_state", None)
-        if not explicit(self.prompt, r"检索一次|搜一次|运行一次|跑一次|启动检索|发起检索|手动检索|运行今日检索|run daily|scan now"):
-            permitted.pop("enqueue_daily", None)
-        if not explicit(self.prompt, r"专题|调研|文献比较|研究报告|deep research"):
-            permitted.pop("start_research", None)
-        if not explicit(self.prompt, r"取消|停止|中止|cancel"):
-            permitted.pop("cancel_research", None)
-        if not explicit(self.prompt, STEERING_INTENT + r"|steer|focus|filter"):
-            permitted.pop("steer_research", None)
-        if not explicit(self.prompt, PDF_INTENT):
-            permitted.pop("fetch_paper_pdf", None)
-        if not list_mcp_servers(self.store, enabled_only=True):
-            permitted.pop("call_external_mcp", None)
+    def _execute_mcp_native(self, srv: dict, tool_meta: dict, raw_arguments: str):
+        try:
+            parsed = json.loads(raw_arguments or "{}")
+            if not isinstance(parsed, dict):
+                return result("MCP 工具参数必须是 JSON 对象", status="error", code="invalid_arguments", retryable=True)
+        except ValueError:
+            return result("MCP 工具参数 JSON 解析失败", status="error", code="invalid_arguments", retryable=True)
+        if srv.get("auto_approve"):
+            try:
+                return result(call_external_mcp_tool(self.store, srv["name"], tool_meta["name"], parsed))
+            except ValueError as err:
+                return result(str(err)[:250], status="error", code="invalid_target")
+        frozen = {"server": srv["name"], "tool": tool_meta["name"], "arguments": parsed}
+        preview = {
+            "label": f"调用外部 MCP：{srv['name']}.{tool_meta['name']}",
+            "server": srv["name"],
+            "tool": tool_meta["name"],
+            "after": parsed,
+        }
+        return result(self.save_action("mcp_call", frozen, preview), status="needs_confirmation")
 
-        definitions = [entry.definition(name) for name, entry in permitted.items()]
-        invalid = {}
-        calls = set()
+    def respond(self, messages, *, resume_state: dict | None = None):
+        # Keep tool definitions fixed across turns to preserve Prefix KV-Cache; safety checks stay in dispatch().
+        permitted = dict(TOOLS)
+        mcp_defs, mcp_lookup = native_mcp_registry(self.store)
+        definitions = [entry.definition(name) for name, entry in permitted.items()] + mcp_defs
+        turn_token_limit = getattr(self.settings, "chat_turn_tokens", 120000)
+        invalid = dict((resume_state or {}).get("invalid") or {})
+        calls = set((resume_state or {}).get("calls") or ())
         handled = {}
         answer = ""
-        reasoning_chunks: list[str] = []
+        reasoning_chunks: list[str] = list((resume_state or {}).get("reasoning_chunks") or [])
         partial_buf: list[str] = []
-        last_flush = [0.0]
+        last_flush = [time.monotonic()]
+
+        def should_cancel() -> bool:
+            if self.bus.is_cancelled(self.turn_id):
+                return True
+            row_status = self.store.one("SELECT status FROM conversation_turns WHERE id=:id", id=self.turn_id)
+            return bool(row_status and row_status["status"] == "cancelled")
 
         def on_delta(kind: str, text: str):
             if kind == "reasoning":
                 reasoning_chunks.append(text)
+                self.bus.publish(self.turn_id, "reasoning_delta", {"turn_id": self.turn_id, "delta": text})
             elif kind == "content":
                 partial_buf.append(text)
+                self.bus.publish(self.turn_id, "text_delta", {"turn_id": self.turn_id, "delta": text})
             now = time.monotonic()
-            if now - last_flush[0] >= 0.25:
+            if now - last_flush[0] >= 1.5:
                 last_flush[0] = now
                 self.store.execute(
                     "UPDATE conversation_turns SET reasoning=:r, partial_answer=:p WHERE id=:id AND status='running'",
@@ -1267,67 +1527,208 @@ class Conversation:
                     id=self.turn_id,
                 )
 
+        def publish_usage():
+            self.bus.publish(
+                self.turn_id,
+                "usage_update",
+                {
+                    "turn_id": self.turn_id,
+                    "calls": self.budget.usage.get("calls", 0),
+                    "max_calls": self.budget.calls,
+                    "tokens": self.budget.usage.get("tokens", 0),
+                    "cost_usd": self.budget.usage.get("cost_usd"),
+                },
+            )
+
+        def run_one_call(call):
+            name = call["function"]["name"]
+            self.progress(name)
+            if name in mcp_lookup:
+                srv, tool_meta = mcp_lookup[name]
+                return self._execute_mcp_native(srv, tool_meta, call["function"]["arguments"])
+            return execute_tool(call, permitted, self.dispatch)
+
         while self.budget.usage.get("calls", 0) < self.budget.calls - 1:
-            row_status = self.store.one("SELECT status FROM conversation_turns WHERE id=:id", id=self.turn_id)
-            if row_status and row_status["status"] == "cancelled":
+            if should_cancel():
                 break
+            steers = pop_pending_steers(self.store, self.conversation_id, self.turn_id)
+            for steer in steers:
+                messages.append({"role": "user", "content": f"[用户运行中补充指令] {steer['prompt']}"})
+                self.events.append({
+                    "name": "_steer",
+                    "arguments": steer["prompt"][:1600],
+                    "result": result({"id": steer["id"], "prompt": steer["prompt"]}, status="ok"),
+                })
+                self.store.execute("UPDATE conversation_turns SET events=:events WHERE id=:id",
+                                   id=self.turn_id, events=dump(self.events))
+                self.bus.publish(self.turn_id, "steer_injected", {"turn_id": self.turn_id, **steer})
             partial_buf.clear()
             raw_resp = self.budget.complete(
-                messages, tools=definitions, stream=getattr(self.settings, "stream_chat", True), on_delta=on_delta,
+                messages,
+                tools=definitions,
+                max_tokens=4096,
+                stream=getattr(self.settings, "stream_chat", True),
+                on_delta=on_delta,
+                should_cancel=should_cancel,
             )
+            publish_usage()
+            if should_cancel():
+                break
             message = model_message(raw_resp)
             if message.get("reasoning_content") and not reasoning_chunks:
                 reasoning_chunks.append(message["reasoning_content"])
             messages.append(message)
             if not message.get("tool_calls"):
+                answer = (message.get("content") or "").strip()
+                finish_reason = (raw_resp.get("choices") or [{}])[0].get("finish_reason")
+                for _ in range(2):
+                    if finish_reason != "length" or should_cancel() or self.budget.usage.get("calls", 0) >= self.budget.calls:
+                        break
+                    messages.append({"role": "user", "content": "你刚才的回答因输出长度达到上限被截断，请紧接着中断处继续输出剩余内容，不要重复已写过的文字。"})
+                    cont_resp = self.budget.complete(
+                        messages,
+                        max_tokens=4096,
+                        stream=getattr(self.settings, "stream_chat", True),
+                        on_delta=on_delta,
+                        should_cancel=should_cancel,
+                    )
+                    publish_usage()
+                    cont_msg = model_message(cont_resp)
+                    messages.append(cont_msg)
+                    extra = (cont_msg.get("content") or "").strip()
+                    if extra:
+                        answer = (answer + extra) if answer else extra
+                    finish_reason = (cont_resp.get("choices") or [{}])[0].get("finish_reason")
                 self.final_reasoning = "".join(reasoning_chunks).strip() or None
-                return (message.get("content") or "").strip()
-            for call in message["tool_calls"]:
+                self.last_messages = messages
+                return answer
+
+            batch_calls = message["tool_calls"]
+            batch_outcomes: dict[int, tuple[dict, int]] = {}
+            parallel_slots: list[tuple[int, dict]] = []
+            serial_slots: list[tuple[int, dict]] = []
+            seen_batch_sigs: set[tuple[str, str]] = set()
+
+            for idx, call in enumerate(batch_calls):
                 name = call["function"]["name"]
-                started = time.monotonic()
+                sig = (name, call["function"]["arguments"])
                 self.trace("tool", "running", detail={"tool": name, "call_id": call["id"]})
-                signature = (name, call["function"]["arguments"])
+                self.bus.publish(self.turn_id, "tool_start", {"turn_id": self.turn_id, "call_id": call["id"], "name": name})
                 if call["id"] in calls or invalid.get(name, 0) >= 2:
-                    outcome = result("该调用已处理，或参数修正次数已用完", status="error", code="repeated_call")
-                elif signature in handled:
-                    outcome = handled[signature]
+                    batch_outcomes[idx] = (result("该调用已处理，或参数修正次数已用完", status="error", code="repeated_call"), 0)
+                elif sig in handled:
+                    batch_outcomes[idx] = (handled[sig], 0)
+                elif name in READ_TOOLS and sig not in seen_batch_sigs:
+                    seen_batch_sigs.add(sig)
+                    parallel_slots.append((idx, call))
                 else:
-                    self.progress(name)
-                    outcome = execute_tool(call, permitted, self.dispatch)
-                    handled[signature] = outcome
-                    if outcome["error_code"] in {"invalid_arguments", "invalid_target"}:
-                        invalid[name] = invalid.get(name, 0) + 1
+                    seen_batch_sigs.add(sig)
+                    serial_slots.append((idx, call))
+
+            if len(parallel_slots) > 1:
+                def _timed_exec(pair):
+                    idx, call = pair
+                    t0 = time.monotonic()
+                    out = run_one_call(call)
+                    return idx, call, out, int((time.monotonic() - t0) * 1000)
+
+                with ThreadPoolExecutor(max_workers=min(4, len(parallel_slots)), thread_name_prefix="radar-tool") as tpool:
+                    for idx, call, out, ms in tpool.map(_timed_exec, parallel_slots):
+                        sig = (call["function"]["name"], call["function"]["arguments"])
+                        handled[sig] = out
+                        batch_outcomes[idx] = (out, ms)
+            elif len(parallel_slots) == 1:
+                idx, call = parallel_slots[0]
+                t0 = time.monotonic()
+                out = run_one_call(call)
+                sig = (call["function"]["name"], call["function"]["arguments"])
+                handled[sig] = out
+                batch_outcomes[idx] = (out, int((time.monotonic() - t0) * 1000))
+
+            for idx, call in serial_slots:
+                sig = (call["function"]["name"], call["function"]["arguments"])
+                if sig in handled:
+                    batch_outcomes[idx] = (handled[sig], 0)
+                    continue
+                t0 = time.monotonic()
+                out = run_one_call(call)
+                handled[sig] = out
+                batch_outcomes[idx] = (out, int((time.monotonic() - t0) * 1000))
+
+            pending_calls = []
+            for idx, call in enumerate(batch_calls):
+                name = call["function"]["name"]
+                outcome, elapsed_ms = batch_outcomes[idx]
+                if outcome["error_code"] in {"invalid_arguments", "invalid_target"}:
+                    invalid[name] = invalid.get(name, 0) + 1
                 calls.add(call["id"])
                 self.events.append({"name": name, "arguments": call["function"]["arguments"][:1600], "result": outcome})
-                self.store.execute("UPDATE conversation_turns SET events=:events WHERE id=:id",
-                                   id=self.turn_id, events=dump(self.events))
                 data = outcome["data"] if isinstance(outcome["data"], dict) else {}
-                self.trace("tool", outcome["status"], elapsed_ms=int((time.monotonic() - started) * 1000),
+                self.trace("tool", outcome["status"], elapsed_ms=elapsed_ms,
                            detail={"tool": name, "call_id": call["id"], "error": outcome["error_code"],
-                                   **{key: data[key] for key in ("total", "action_id", "job", "status") if key in data}})
-                messages.append(tool_message(call, outcome))
-            if estimate_tokens(messages) > 28000:
+                                   **{key: data[key] for key in ("total", "action_id", "job", "status", "artifact_id") if key in data}})
+                self.bus.publish(self.turn_id, "tool_done", {
+                    "turn_id": self.turn_id,
+                    "call_id": call["id"],
+                    "name": name,
+                    "status": outcome["status"],
+                    "elapsed_ms": elapsed_ms,
+                })
+                if outcome["status"] == "needs_confirmation":
+                    pending_calls.append({
+                        "call_id": call["id"],
+                        "action_id": data.get("action_id"),
+                        "tool": name,
+                    })
+                else:
+                    messages.append(tool_message(call, outcome))
+            self.store.execute("UPDATE conversation_turns SET events=:events WHERE id=:id",
+                               id=self.turn_id, events=dump(self.events))
+            if pending_calls:
+                self.final_reasoning = "".join(reasoning_chunks).strip() or None
+                self.last_messages = messages
+                self.suspended = {
+                    "pending_calls": pending_calls,
+                    "messages": messages,
+                    "calls": sorted(calls),
+                    "invalid": invalid,
+                    "reasoning_chunks": reasoning_chunks[-40:],
+                }
+                return "已生成下方的确认卡。核对设置和范围后，点击「确认执行」。"
+            if estimate_tokens(messages) > turn_token_limit:
                 break
-        if messages[-1]["role"] == "tool":
+        if messages[-1]["role"] == "tool" and not should_cancel():
             messages.append({"role": "system", "content": "请根据已有工具结果简洁回复。明确错误、待确认和已提交任务。"})
             partial_buf.clear()
-            message = model_message(self.budget.complete(
-                messages, stream=getattr(self.settings, "stream_chat", True), on_delta=on_delta,
-            ))
+            raw_final = self.budget.complete(
+                messages,
+                max_tokens=4096,
+                stream=getattr(self.settings, "stream_chat", True),
+                on_delta=on_delta,
+                should_cancel=should_cancel,
+            )
+            publish_usage()
+            message = model_message(raw_final)
             if message.get("reasoning_content") and not reasoning_chunks:
                 reasoning_chunks.append(message["reasoning_content"])
+            messages.append(message)
             answer = message.get("content") or ""
         self.final_reasoning = "".join(reasoning_chunks).strip() or None
+        self.last_messages = messages
         return answer.strip()
 
 
 def cancel_turn(store, conversation_id, key):
+    TURN_BUS.mark_cancelled(key)
     with store.transaction() as con:
         updated = write(con, """UPDATE conversation_turns SET status='cancelled',
             answer=coalesce(partial_answer,'已停止生成。'), partial_answer=NULL
-            WHERE id=:id AND conversation_id=:chat AND status IN ('queued','running')""", id=key, chat=conversation_id)
+            WHERE id=:id AND conversation_id=:chat AND status IN ('queued','running','awaiting_confirmation')""",
+            id=key, chat=conversation_id)
         if updated.rowcount:
+            write(con, "UPDATE conversation_actions SET status='dismissed' WHERE turn_id=:id AND status='pending'", id=key)
             log_event(store, "chat", key, "turn", "cancelled", connection=con)
+            TURN_BUS.publish(key, "turn_state", {"turn_id": key, "status": "cancelled"})
         return bool(updated.rowcount)
 
 
@@ -1338,10 +1739,11 @@ def expire_turn(store, settings, key):
             WHERE id=:id AND status='running' AND created_at<=:cutoff""", id=key, cutoff=cutoff)
         if updated.rowcount:
             log_event(store, "chat", key, "turn", "error", detail={"error": "interrupted"}, connection=con)
+            TURN_BUS.publish(key, "turn_state", {"turn_id": key, "status": "error"})
         return bool(updated.rowcount)
 
 
-def queue_turn(store, settings, conversation_id, prompt, *, turn_id=None):
+def queue_turn(store, settings, conversation_id, prompt, *, turn_id=None, parent_turn_id=None):
     prompt = prompt.strip()
     if not 1 <= len(prompt) <= 4500:
         raise ValueError("请输入 1 至 4500 字")
@@ -1362,8 +1764,16 @@ def queue_turn(store, settings, conversation_id, prompt, *, turn_id=None):
         if row(con, """SELECT 1 FROM conversation_turns WHERE conversation_id=:id
                         AND status IN ('queued','running')""", id=conversation_id):
             raise ValueError("当前会话还有一条消息在处理")
+        # If the user sends a fresh turn instead of confirming an awaiting card, close the waiting turn cleanly.
+        write(con, """UPDATE conversation_turns SET status='done'
+            WHERE conversation_id=:id AND status='awaiting_confirmation'""", id=conversation_id)
         write(con, """INSERT INTO conversation_turns(id,conversation_id,prompt,status,created_at)
             VALUES (:id,:chat,:prompt,'queued',:now)""", id=key, chat=conversation_id, prompt=prompt, now=now)
+        if parent_turn_id:
+            write(con, """INSERT INTO conversation_turn_runtime(turn_id, parent_turn_id, updated_at)
+                          VALUES (:tid, :pid, :now)
+                          ON CONFLICT(turn_id) DO UPDATE SET parent_turn_id=excluded.parent_turn_id, updated_at=excluded.updated_at""",
+                  tid=key, pid=parent_turn_id, now=now)
         write(con, """UPDATE conversations SET opened_at=:now,title=CASE WHEN title='新对话' THEN :title ELSE title END
             WHERE id=:chat""", now=now, title=" ".join(prompt.split())[:36], chat=conversation_id)
         log_event(store, "chat", key, "turn", "queued", connection=con)
@@ -1375,40 +1785,14 @@ def submit_turn(store, settings, conversation_id, prompt, *, progress=lambda _na
     return run_turn(store, settings, key, progress=progress, client=client)
 
 
-def run_turn(store, settings, key, *, progress=lambda _name: None, client=None):
-    with store.transaction() as con:
-        chat = row(con, """SELECT c.context,t.conversation_id,t.prompt FROM conversation_turns t JOIN conversations c
-                           ON c.id=t.conversation_id WHERE t.id=:id AND t.status='queued'""", id=key)
-        if not chat:
-            return key
-        write(con, "UPDATE conversation_turns SET status='running',created_at=:started WHERE id=:id",
-              id=key, started=utc_now().isoformat())
-        log_event(store, "chat", key, "turn", "running", connection=con)
-    started = time.monotonic()
-    conversation_id, prompt = chat["conversation_id"], chat["prompt"]
-    chat_context = json.loads(chat["context"])
-    original_context = dict(chat_context)
-    timezone = "Asia/Hong_Kong"
-    if chat_context.get("topic"):
-        try:
-            timezone = store.topic(chat_context["topic"])[0].timezone
-        except ValueError:
-            pass
-    request_context = {**chat_context, "timezone": timezone,
-                       "local_date": utc_now().astimezone(ZoneInfo(timezone)).date().isoformat()}
-    history = [turn for turn in turns(store, conversation_id) if turn["id"] != key]
-    own_client = client is None
-    client = client or httpx.Client()
-    conversation = Conversation(store, settings, client, conversation_id, key, prompt, chat_context, progress)
-    conversation.final_reasoning = None
-    compact_history(history, chat_context, settings, client)
-    request_context = {**chat_context, "timezone": timezone,
-                       "local_date": utc_now().astimezone(ZoneInfo(timezone)).date().isoformat(),
-                       "project_memory": conversation.memory(chat_context.get("topic"))}
+def _execute_turn_loop(store, settings, key, *, conversation_id, prompt, chat_context, original_context,
+                       conversation, init_messages, init_len, resume_state=None, started=None):
+    started = started or time.monotonic()
     status = "done"
     try:
-        answer = conversation.respond(recent_messages(history, request_context, prompt)) or "请查看下方工具结果。"
-        if any(event["result"]["status"] == "needs_confirmation" for event in conversation.events):
+        answer = conversation.respond(init_messages, resume_state=resume_state) or "请查看下方工具结果。"
+        if conversation.suspended:
+            status = "awaiting_confirmation"
             answer = "已生成下方的确认卡。核对设置和范围后，点击「确认执行」。"
     except BudgetExceeded as error:
         complete_events = [event for event in conversation.events if event["result"]["status"] in {"ok", "needs_confirmation"}]
@@ -1423,15 +1807,30 @@ def run_turn(store, settings, key, *, progress=lambda _name: None, client=None):
     except Exception as error:
         logger.error("conversation turn %s interrupted: %s", key, type(error).__name__)
         status, answer = "error", "这一轮处理已中断。可以查看下方已记录的操作并重试。"
-    finally:
-        if own_client:
-            client.close()
+
+    TURN_BUS.clear_cancelled(key)
+    state_json = None
+    if conversation.suspended:
+        state_json = dump({**conversation.suspended, "init_len": init_len})
+    turn_trajectory = (
+        [{"role": "user", "content": prompt}, *conversation.last_messages[init_len:]]
+        if conversation.last_messages and not conversation.suspended
+        else []
+    )
     with store.transaction() as con:
         saved = write(con, """UPDATE conversation_turns SET status=:status,answer=:answer,
                               reasoning=:reasoning,partial_answer=NULL WHERE id=:id AND status='running'""",
                       status=status, answer=answer, reasoning=conversation.final_reasoning, id=key)
         if not saved.rowcount:
-            return key
+            return key, status
+        write(con, """INSERT INTO conversation_turn_runtime(turn_id, state_json, messages_json, updated_at)
+                      VALUES (:tid, :state, :msgs, :now)
+                      ON CONFLICT(turn_id) DO UPDATE SET
+                        state_json=excluded.state_json,
+                        messages_json=coalesce(excluded.messages_json, conversation_turn_runtime.messages_json),
+                        updated_at=excluded.updated_at""",
+              tid=key, state=state_json, msgs=dump(turn_trajectory) if turn_trajectory else None,
+              now=utc_now().isoformat())
         current = json.loads(row(con, "SELECT context FROM conversations WHERE id=:id", id=conversation_id)["context"])
         for field in original_context.keys() | chat_context.keys():
             if current.get(field) == original_context.get(field) and chat_context.get(field) != original_context.get(field):
@@ -1442,7 +1841,162 @@ def run_turn(store, settings, key, *, progress=lambda _name: None, client=None):
         write(con, "UPDATE conversations SET context=:context WHERE id=:id", context=dump(current), id=conversation_id)
         log_event(store, "chat", key, "turn", status, elapsed_ms=int((time.monotonic() - started) * 1000),
                   detail={"calls": conversation.budget.usage.get("calls", 0)}, connection=con)
+    TURN_BUS.publish(key, "turn_state", {"turn_id": key, "status": status})
+    return key, status
+
+
+def _drain_followup(store, settings, conversation_id, parent_turn_id, *, progress, client):
+    nxt = pop_next_followup(store, conversation_id)
+    if not nxt:
+        return
+    next_turn_id = queue_turn(store, settings, conversation_id, nxt["prompt"], parent_turn_id=parent_turn_id)
+    TURN_BUS.publish(parent_turn_id, "followup_started", {"turn_id": next_turn_id, "prompt": nxt["prompt"]})
+    run_turn(store, settings, next_turn_id, progress=progress, client=client)
+
+
+def run_turn(store, settings, key, *, progress=lambda _name: None, client=None):
+    with store.transaction() as con:
+        chat = row(con, """SELECT c.context,t.conversation_id,t.prompt FROM conversation_turns t JOIN conversations c
+                           ON c.id=t.conversation_id WHERE t.id=:id AND t.status='queued'""", id=key)
+        if not chat:
+            return key
+        write(con, "UPDATE conversation_turns SET status='running',created_at=:started WHERE id=:id",
+              id=key, started=utc_now().isoformat())
+        log_event(store, "chat", key, "turn", "running", connection=con)
+    TURN_BUS.clear_cancelled(key)
+    started = time.monotonic()
+    conversation_id, prompt = chat["conversation_id"], chat["prompt"]
+    chat_context = json.loads(chat["context"])
+    original_context = dict(chat_context)
+    timezone = "Asia/Hong_Kong"
+    if chat_context.get("topic"):
+        try:
+            timezone = store.topic(chat_context["topic"])[0].timezone
+        except ValueError:
+            pass
+    history = [turn for turn in turns(store, conversation_id) if turn["id"] != key]
+    own_client = client is None
+    client = client or httpx.Client()
+    conversation = Conversation(store, settings, client, conversation_id, key, prompt, chat_context, progress)
+    compact_history(history, chat_context, settings, client, store=store, conversation_id=conversation_id)
+    request_context = {**chat_context, "timezone": timezone,
+                       "local_date": utc_now().astimezone(ZoneInfo(timezone)).date().isoformat(),
+                       "project_memory": conversation.memory(chat_context.get("topic"))}
+    init_messages = recent_messages(
+        history,
+        request_context,
+        prompt,
+        token_budget=getattr(settings, "chat_history_tokens", 48000),
+    )
+    try:
+        _, final_status = _execute_turn_loop(
+            store, settings, key,
+            conversation_id=conversation_id,
+            prompt=prompt,
+            chat_context=chat_context,
+            original_context=original_context,
+            conversation=conversation,
+            init_messages=init_messages,
+            init_len=len(init_messages),
+            started=started,
+        )
+        if final_status in {"done", "partial"}:
+            _drain_followup(store, settings, conversation_id, key, progress=progress, client=client)
+    finally:
+        if own_client:
+            client.close()
     return key
+
+
+def prepare_resume_turn(store, conversation_id: str, turn_id: str) -> bool:
+    """Transition a suspended awaiting_confirmation turn back to queued once all actions are settled."""
+    with store.transaction() as con:
+        turn = row(con, "SELECT status FROM conversation_turns WHERE id=:id AND conversation_id=:cid",
+                   id=turn_id, cid=conversation_id)
+        if not turn or turn["status"] != "awaiting_confirmation":
+            return False
+        pending = row(con, "SELECT 1 FROM conversation_actions WHERE turn_id=:id AND status='pending' LIMIT 1",
+                      id=turn_id)
+        if pending:
+            return False
+        runtime = row(con, "SELECT state_json FROM conversation_turn_runtime WHERE turn_id=:id", id=turn_id)
+        if not runtime or not runtime["state_json"]:
+            return False
+        write(con, "UPDATE conversation_turns SET status='queued', created_at=:now WHERE id=:id AND status='awaiting_confirmation'",
+              id=turn_id, now=utc_now().isoformat())
+        log_event(store, "chat", turn_id, "turn", "resuming", connection=con)
+        return True
+
+
+def resume_turn(store, settings, key, *, progress=lambda _name: None, client=None):
+    with store.transaction() as con:
+        chat = row(con, """SELECT c.context, t.conversation_id, t.prompt, t.events, t.usage, r.state_json
+                           FROM conversation_turns t
+                           JOIN conversations c ON c.id=t.conversation_id
+                           JOIN conversation_turn_runtime r ON r.turn_id=t.id
+                           WHERE t.id=:id AND t.status='queued'""", id=key)
+        if not chat or not chat["state_json"]:
+            return key
+        write(con, "UPDATE conversation_turns SET status='running',created_at=:started WHERE id=:id",
+              id=key, started=utc_now().isoformat())
+        log_event(store, "chat", key, "turn", "running", detail={"resumed": True}, connection=con)
+    TURN_BUS.clear_cancelled(key)
+    started = time.monotonic()
+    conversation_id, prompt = chat["conversation_id"], chat["prompt"]
+    chat_context = json.loads(chat["context"])
+    original_context = dict(chat_context)
+    state = json.loads(chat["state_json"])
+    messages = list(state.get("messages") or [])
+    for pending in state.get("pending_calls") or []:
+        action = store.one("SELECT status, receipt FROM conversation_actions WHERE id=:id", id=pending["action_id"])
+        if action and action["status"] == "applied":
+            receipt = json.loads(action["receipt"] or "{}")
+            outcome = result(receipt, status="ok")
+        else:
+            outcome = result("用户已取消该确认操作，未执行写入。", status="cancelled", code="user_dismissed")
+        messages.append(tool_message({"id": pending["call_id"]}, outcome))
+    usage = json.loads(chat["usage"] or "{}")
+    usage.pop("stop_reason", None)
+    own_client = client is None
+    client = client or httpx.Client()
+    conversation = Conversation(store, settings, client, conversation_id, key, prompt, chat_context, progress, usage=usage)
+    conversation.events = json.loads(chat["events"] or "[]")
+    try:
+        _, final_status = _execute_turn_loop(
+            store, settings, key,
+            conversation_id=conversation_id,
+            prompt=prompt,
+            chat_context=chat_context,
+            original_context=original_context,
+            conversation=conversation,
+            init_messages=messages,
+            init_len=int(state.get("init_len") or 0),
+            resume_state=state,
+            started=started,
+        )
+        if final_status in {"done", "partial"}:
+            _drain_followup(store, settings, conversation_id, key, progress=progress, client=client)
+    finally:
+        if own_client:
+            client.close()
+    return key
+
+
+def manual_compact(store, settings, conversation_id: str, *, client=None) -> dict:
+    chat = store.one("SELECT context FROM conversations WHERE id=:id", id=conversation_id)
+    if not chat:
+        raise ValueError("找不到会话")
+    ctx = json.loads(chat["context"] or "{}")
+    hist = turns(store, conversation_id)
+    own_client = client is None
+    client = client or httpx.Client()
+    try:
+        comp = compact_history(hist, ctx, settings, client, store=store, conversation_id=conversation_id, force=True)
+    finally:
+        if own_client:
+            client.close()
+    store.execute("UPDATE conversations SET context=:ctx WHERE id=:id", ctx=dump(ctx), id=conversation_id)
+    return {"compacted": bool(comp), "compaction": comp, "compacted_count": ctx.get("compacted_count", 0)}
 
 
 def confirm_action(store, conversation_id, key, *, approve=True, settings=None, client=None):
@@ -1459,8 +2013,8 @@ def confirm_action(store, conversation_id, key, *, approve=True, settings=None, 
                       detail={"action": saved["kind"], "action_id": key}, connection=con)
             return None
         args, kind = json.loads(saved["arguments"]), saved["kind"]
-        if kind == "sync_zotero":
-            # Perform external network sync before persisting receipt so SQLite lock isn't held during HTTP I/O.
+        if kind in {"sync_zotero", "mcp_call"}:
+            # Perform external network/subprocess I/O before persisting receipt so SQLite lock isn't held.
             pass
         else:
             receipt = {"label": ACTION_LABELS[kind], "status": "done"}
@@ -1494,6 +2048,18 @@ def confirm_action(store, conversation_id, key, *, approve=True, settings=None, 
                 retry_notification(store, args["run_id"], connection=con)
                 receipt.update(run_id=args["run_id"], status="queued")
             return _finalize_confirmation(store, con, conversation_id, key, saved["turn_id"], kind, receipt)
+
+    if kind == "mcp_call":
+        mcp_out = call_external_mcp_tool(store, args["server"], args["tool"], args.get("arguments") or {})
+        receipt = {
+            "label": ACTION_LABELS["mcp_call"],
+            "status": "error" if mcp_out.get("isError") else "done",
+            "server": args["server"],
+            "tool": args["tool"],
+            "output": mcp_out,
+        }
+        with store.transaction() as con:
+            return _finalize_confirmation(store, con, conversation_id, key, saved["turn_id"], "mcp_call", receipt)
 
     # sync_zotero path outside write lock
     cfg = settings or Settings.from_env()

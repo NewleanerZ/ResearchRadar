@@ -81,10 +81,39 @@ export interface TurnItem {
   reasoning?: string | null
   partial_answer?: string | null
   status: string
-  events: Array<{ name: string; result: { status: string; data: any } }>
+  events: Array<{ name: string; arguments?: string; result: { status: string; data: any } }>
+  usage?: { calls?: number; tokens?: number; cost_usd?: number }
   actions: Array<{ id: string; kind: string; status: string; preview: any; receipt: any }>
   research_jobs: ResearchJobItem[]
   timeline: TimelineEvent[]
+  created_at: string
+}
+
+export interface StreamTurnMeta {
+  activeTools: Record<string, { call_id: string; name: string; status: string; elapsed_ms?: number }>
+  subagents: Record<string, { subagent_id: string; role: string; stage: string; detail?: string; elapsed_ms?: number }>
+  liveUsage?: { calls?: number; max_calls?: number; tokens?: number; cost_usd?: number }
+  followupTurnId?: string
+}
+
+export interface ArtifactDetail {
+  id: string
+  conversation_id: string
+  turn_id: string
+  tool_name: string
+  title: string
+  mime_type: string
+  char_count: number
+  content: string
+  created_at: string
+}
+
+export interface SteerQueueItem {
+  id: string
+  turn_id?: string | null
+  mode: "steer" | "follow_up"
+  prompt: string
+  status: string
   created_at: string
 }
 
@@ -168,7 +197,7 @@ export async function apiFetch<T>(path: string, init: RequestInit = {}): Promise
 
 export function streamTurnEvents(
   turnId: string,
-  onUpdate: (turn: TurnItem, complete: boolean) => void,
+  onUpdate: (turn: TurnItem, complete: boolean, meta: StreamTurnMeta) => void,
   onError?: (err: string) => void
 ): () => void {
   const controller = new AbortController()
@@ -177,6 +206,23 @@ export function streamTurnEvents(
   if (token) headers["Authorization"] = `Bearer ${token}`
 
   ;(async () => {
+    let currentTurn: TurnItem | null = null
+    const meta: StreamTurnMeta = { activeTools: {}, subagents: {} }
+    const emit = (complete: boolean) => {
+      if (currentTurn) {
+        onUpdate(
+          { ...currentTurn },
+          complete,
+          {
+            activeTools: { ...meta.activeTools },
+            subagents: { ...meta.subagents },
+            liveUsage: meta.liveUsage ? { ...meta.liveUsage } : undefined,
+            followupTurnId: meta.followupTurnId,
+          }
+        )
+      }
+    }
+
     try {
       const resp = await fetch(`/api/chat/turns/${encodeURIComponent(turnId)}/stream`, {
         headers,
@@ -209,8 +255,53 @@ export function streamTurnEvents(
             onError?.(parsed.message || "流式返回异常")
             return
           }
-          const turnPayload = JSON.parse(dataStr) as TurnItem
-          onUpdate(turnPayload, eventName === "complete")
+          const payload = JSON.parse(dataStr)
+          if (eventName === "snapshot" || eventName === "update") {
+            currentTurn = payload as TurnItem
+            emit(false)
+          } else if (eventName === "complete") {
+            currentTurn = payload as TurnItem
+            emit(true)
+          } else if (eventName === "reasoning_delta" && currentTurn) {
+            currentTurn.reasoning = (currentTurn.reasoning || "") + (payload.delta || "")
+            emit(false)
+          } else if (eventName === "text_delta" && currentTurn) {
+            currentTurn.partial_answer = (currentTurn.partial_answer || "") + (payload.delta || "")
+            emit(false)
+          } else if (eventName === "tool_start") {
+            meta.activeTools[payload.call_id] = {
+              call_id: payload.call_id,
+              name: payload.name,
+              status: "running",
+            }
+            emit(false)
+          } else if (eventName === "tool_done") {
+            meta.activeTools[payload.call_id] = {
+              call_id: payload.call_id,
+              name: payload.name,
+              status: payload.status || "ok",
+              elapsed_ms: payload.elapsed_ms,
+            }
+            emit(false)
+          } else if (eventName === "subagent_progress") {
+            meta.subagents[payload.subagent_id] = {
+              subagent_id: payload.subagent_id,
+              role: payload.role,
+              stage: payload.stage,
+              detail: payload.detail,
+              elapsed_ms: payload.elapsed_ms,
+            }
+            emit(false)
+          } else if (eventName === "usage_update") {
+            meta.liveUsage = payload
+            emit(false)
+          } else if (eventName === "turn_state" && currentTurn) {
+            currentTurn.status = payload.status || currentTurn.status
+            emit(false)
+          } else if (eventName === "followup_started") {
+            meta.followupTurnId = payload.turn_id
+            emit(false)
+          }
         }
       }
     } catch (err: any) {
