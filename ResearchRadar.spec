@@ -52,14 +52,24 @@ a = Analysis(
     noarchive=False,
 )
 
-# Pin OpenSSL 3.5.9 DLLs from base Python so PySide6/wheel copies (3.0.15) never shadow _ssl.pyd
+# Pin OpenSSL 3.5.9 DLLs from base Python & PySide6 MSVC 14.44 runtime, and drop stray system ICU DLLs
 _base_dlls = Path(sys.base_prefix) / "DLLs"
-_pinned_ssl = {"libssl-3-x64.dll", "libcrypto-3-x64.dll"}
-a.binaries = [b for b in a.binaries if Path(b[0]).name.lower() not in _pinned_ssl]
+_pyside6_dir = Path(sys.prefix) / "Lib" / "site-packages" / "PySide6"
+_drop_root_names = {"libssl-3-x64.dll", "libcrypto-3-x64.dll"}
+_vc_runtime = ("msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll", "vcruntime140.dll", "vcruntime140_1.dll")
+a.binaries = [
+    b for b in a.binaries
+    if not (Path(b[0]).name.lower() in _drop_root_names or (Path(b[0]).parent == Path(".") and Path(b[0]).name.lower().startswith("icu")))
+    and not (Path(b[0]).parent == Path(".") and Path(b[0]).name.lower() in _vc_runtime)
+]
 for _dll_name in ("libssl-3-x64.dll", "libcrypto-3-x64.dll"):
     _src_dll = _base_dlls / _dll_name
     if _src_dll.exists():
         a.binaries.append((_dll_name, str(_src_dll), "BINARY"))
+for _vc_name in _vc_runtime:
+    _src_vc = _pyside6_dir / _vc_name
+    if _src_vc.exists():
+        a.binaries.append((_vc_name, str(_src_vc), "BINARY"))
 
 pyz = PYZ(a.pure)
 
