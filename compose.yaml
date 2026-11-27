@@ -1,0 +1,35 @@
+name: researchradar
+
+x-radar: &radar
+  image: research-radar:local
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    RADAR_DATA_DIR: /data
+  volumes:
+    - radar-data:/data
+  restart: unless-stopped
+
+services:
+  scheduler:
+    <<: *radar
+    build: .
+  ui:
+    <<: *radar
+    depends_on:
+      - scheduler
+    command:
+      - python
+      - -m
+      - streamlit
+      - run
+      - streamlit_app.py
+      - --server.address=0.0.0.0
+      - --server.headless=true
+      - --browser.gatherUsageStats=false
+    ports:
+      - "127.0.0.1:8501:8501"
+
+volumes:
+  radar-data:
