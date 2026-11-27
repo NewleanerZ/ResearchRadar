@@ -12,9 +12,11 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 pytest-cache-files-*/
+/tests/
 *.egg-info/
 /build/
 /dist/
+logs/
 *.spec
 web/node_modules/
 /web/dist/

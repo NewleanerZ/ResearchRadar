@@ -88,11 +88,3 @@ ssh -N -L 8000:127.0.0.1:8000 user@your-server
 通过 SSH 隧道打开 `http://127.0.0.1:8000`，在网页输入 `RADAR_API_TOKEN`。容器的启动配置来自宿主机的 `.env`。修改后运行 `docker compose up -d --force-recreate` 使配置生效。
 
 旧部署迁移时，在同一目录以 `docker compose up -d --remove-orphans` 启动新版，可移除旧网页容器并沿用原有卷。备份时先停止调度器，使用 `docker compose run --rm scheduler python -m research_radar.cli backup /data/radar.backup.sqlite3` 并将备份复制到卷外。恢复时先停止网页和调度器，保存现有 SQLite 及 WAL/SHM 文件，再用已验证的备份恢复数据库。可运行 `restore-reports` 从数据库重建 Markdown 报告。
-
-## 测试
-
-```bash
-uv run --locked --extra ui python -B -m pytest -q -p no:cacheprovider
-npm --prefix web ci
-npm --prefix web run build
-```
