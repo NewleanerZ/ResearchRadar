@@ -32,6 +32,7 @@ from .rag import hybrid_search, index_chunk_records
 from .ranking import best_record, request_completion
 from .subagent import run_subagent_batch
 from .turn_bus import TURN_BUS
+from .web_search import read_webpage, web_search
 from .zotero import pull_zotero_collection, push_favorites_to_zotero
 from .project_memory import ProjectMemory, memory_snapshot
 from .research_control import ResearchAdjustment, cancel_pending_adjustments, queue_adjustment
@@ -221,6 +222,16 @@ class RunSubagentArg(Arguments):
     tasks: list[SubagentTask] = Field(min_length=1, max_length=5)
 
 
+class WebSearchArg(Arguments):
+    query: str = Field(min_length=1, max_length=240)
+    focus: Literal["general", "code", "models", "blogs"] = "general"
+    limit: int = Field(default=8, ge=1, le=15)
+
+
+class ReadWebpageArg(Arguments):
+    url: str = Field(min_length=10, max_length=500)
+
+
 TOOLS = {
     "list_topics": Tool("列出主题和关注状态，返回真实主题 ID。", ListTopics),
     "search_library": Tool("查已收录论文，query 使用作者或学术英文关键词（可省略），支持 venues 顶会过滤和按 date/citations 排序。", SearchLibrary),
@@ -256,6 +267,15 @@ TOOLS = {
         "派发 1–5 个独立短上下文的只读科研子代理并发查证（适合多篇论文对照核查、批量文献筛选与证据抽取，避免主对话上下文膨胀）。",
         RunSubagentArg,
     ),
+    "web_search": Tool(
+        "开源全网检索（优先使用已配置的 SearXNG，否则自动并发查询 DuckDuckGo、GitHub 仓库与 Hugging Face 模型）。"
+        "适用于查找开源代码库、Star/下载量、技术综述博客、榜单或非学术元数据信息；学术论文查证仍优先使用 search_library 与 search_external_papers。",
+        WebSearchArg,
+    ),
+    "read_webpage": Tool(
+        "安全抓取并提取指定公开 HTTPS 网页（如 GitHub README、项目主页、技术博客、Leaderboard）的可读正文与链接（自动过滤内网与恶意地址）。",
+        ReadWebpageArg,
+    ),
     "set_paper_state": Tool("按用户明确指令设置某一篇论文的收藏或阅读状态。", PaperState),
     "enqueue_daily": Tool("按用户明确请求提交一个主题的今日检索。", TopicArg),
     "draft_topic": Tool("直接传入生成好的主题配置草案。使用 1–6 个具体英文检索短语，不会保存主题。", DraftArg),
@@ -274,11 +294,12 @@ READ_TOOLS = {
     "list_topics", "search_library", "search_external_papers", "rag_search",
     "fetch_paper_summary", "fetch_paper_pdf", "get_paper", "get_report",
     "get_trend", "get_run", "get_project_memory", "list_projects", "compare_methods", "list_research_events",
-    "list_external_mcp", "read_artifact", "run_subagent",
+    "list_external_mcp", "read_artifact", "run_subagent", "web_search", "read_webpage",
 }
 SUBAGENT_READ_TOOLS = (
     "search_library", "search_external_papers", "rag_search",
     "fetch_paper_summary", "fetch_paper_pdf", "get_paper", "get_project_memory", "read_artifact",
+    "web_search", "read_webpage",
 )
 ACTION_LABELS = {
     "create_topic": "创建主题", "edit_topic": "修改主题", "follow": "关注主题", "unfollow": "取消关注",
@@ -296,6 +317,8 @@ SYSTEM = (
     "按需传 venues 与 sort_by='citations'）主动检索并呈现结果，不要因外部 MCP 为空而拒答，也不要先反问建主题方案再干活。"
     "查已收录论文中某组顶会或排序时，直接在 search_library 传入 venues 与 sort_by，勿仅凭前10条时间排序推断全库无顶会论文。"
     "查论文时区分库内收录（search_library）与外部公开检索（search_external_papers）；"
+    "需要检索 GitHub 开源代码/仓库、Hugging Face 模型、技术博客脉络、项目主页或榜单时调用 web_search 和 read_webpage，"
+    "学术论文元数据、引用量排序与顶会录用核实仍严格以 search_library / search_external_papers 为准，不用博客替代学术出版核验。"
     "总结具体某篇论文时，默认只用 get_paper、search_external_papers 或 fetch_paper_summary 基于摘要、元数据和公开网页总结，不主动获取或下载 PDF；"
     "只有当用户明确提出要获取/下载/读取/解析原始 PDF 或全文时，才调用 fetch_paper_pdf 或带 fetch_pdf=True 的 deep_read_paper。"
     "仅当用户明确要求创建或订阅主题时再用 propose_action(action=create_topic, draft=草案)。"
@@ -1074,6 +1097,43 @@ class Conversation:
                 payload,
                 inline_chars=getattr(self.settings, "artifact_inline_chars", 2400),
                 summary_builder=lambda data: {**data, "chunks": data["chunks"][:3]},
+            )
+            return result(compact)
+        if name == "web_search":
+            data = web_search(
+                self.settings,
+                args.query,
+                focus=args.focus,
+                limit=args.limit,
+                deadline=min(self.budget.deadline, time.monotonic() + 18.0),
+            )
+            compact, _ = maybe_offload_tool_output(
+                self.store,
+                self.conversation_id,
+                self.turn_id,
+                "web_search",
+                f"全网检索：{args.query[:80]}",
+                data,
+                inline_chars=getattr(self.settings, "artifact_inline_chars", 2400),
+                summary_builder=lambda d: {**d, "results": d["results"][:5]},
+            )
+            return result(compact)
+        if name == "read_webpage":
+            data = read_webpage(
+                self.settings,
+                args.url,
+                deadline=min(self.budget.deadline, time.monotonic() + 18.0),
+            )
+            compact, _ = maybe_offload_tool_output(
+                self.store,
+                self.conversation_id,
+                self.turn_id,
+                "read_webpage",
+                data.get("title") or args.url[:80],
+                data,
+                inline_chars=getattr(self.settings, "artifact_inline_chars", 2400),
+                mime_type="text/markdown",
+                summary_builder=lambda d: {**d, "content": (d.get("content") or "")[:1200]},
             )
             return result(compact)
         if name == "read_artifact":

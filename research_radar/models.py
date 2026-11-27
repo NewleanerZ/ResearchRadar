@@ -135,6 +135,8 @@ class Settings(BaseModel):
     chat_history_tokens: int = Field(default=48000, ge=4000, le=180000)
     chat_turn_tokens: int = Field(default=120000, ge=16000, le=250000)
     artifact_inline_chars: int = Field(default=2400, ge=600, le=20000)
+    searxng_url: str = ""
+    jina_reader_enabled: bool = False
     s2_api_key: SecretStr = SecretStr("")
     github_token: SecretStr = SecretStr("")
     hf_token: SecretStr = SecretStr("")
@@ -169,6 +171,7 @@ class Settings(BaseModel):
             "chat_max_calls": "RADAR_CHAT_MAX_CALLS", "chat_max_seconds": "RADAR_CHAT_MAX_SECONDS",
             "chat_history_tokens": "RADAR_CHAT_HISTORY_TOKENS", "chat_turn_tokens": "RADAR_CHAT_TURN_TOKENS",
             "artifact_inline_chars": "RADAR_ARTIFACT_INLINE_CHARS",
+            "searxng_url": "RADAR_SEARXNG_URL", "jina_reader_enabled": "RADAR_JINA_READER",
             "s2_api_key": "S2_API_KEY", "github_token": "GITHUB_TOKEN", "hf_token": "HF_TOKEN",
             "zotero_api_key": "ZOTERO_API_KEY", "zotero_user_id": "ZOTERO_USER_ID",
             "api_token": "RADAR_API_TOKEN", "api_host": "RADAR_API_HOST", "api_port": "RADAR_API_PORT",

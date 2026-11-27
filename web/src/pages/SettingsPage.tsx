@@ -100,6 +100,8 @@ export function SettingsPage() {
   const [streamChat, setStreamChat] = useState(true)
   const [keywordOnly, setKeywordOnly] = useState(false)
   const [extraSources, setExtraSources] = useState<string[]>([])
+  const [searxngUrl, setSearxngUrl] = useState("")
+  const [jinaReader, setJinaReader] = useState(false)
   const [hfMirror, setHfMirror] = useState("")
   const [secretInputs, setSecretInputs] = useState<Record<string, string>>({})
   const [secretClears, setSecretClears] = useState<Record<string, boolean>>({})
@@ -118,6 +120,8 @@ export function SettingsPage() {
       setStreamChat(Boolean(cfg.stream_chat))
       setKeywordOnly(Boolean(cfg.keyword_only))
       setExtraSources(cfg.extra_sources || [])
+      setSearxngUrl(cfg.searxng_url || "")
+      setJinaReader(Boolean(cfg.jina_reader_enabled))
       setHfMirror(cfg.hf_endpoint || "")
     }
   }, [diagQuery.data])
@@ -644,6 +648,25 @@ export function SettingsPage() {
                 </div>
               </div>
 
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                <div>
+                  <label className="mb-1 block text-[11px] text-[var(--muted-foreground)]">
+                    自托管 SearXNG 地址（可选，如 http://127.0.0.1:8888；留空则自动使用 DuckDuckGo / GitHub / HF）
+                  </label>
+                  <Input
+                    placeholder="http://127.0.0.1:8888"
+                    value={searxngUrl}
+                    onChange={(e) => setSearxngUrl(e.target.value)}
+                  />
+                </div>
+                <div className="flex items-center gap-3 pt-5">
+                  <label className="inline-flex items-center gap-2 cursor-pointer">
+                    <Switch checked={jinaReader} onCheckedChange={setJinaReader} />
+                    <span>优先使用 Jina Reader 提取网页正文</span>
+                  </label>
+                </div>
+              </div>
+
               <div className="flex justify-end">
                 <Button
                   size="sm"
@@ -656,6 +679,8 @@ export function SettingsPage() {
                         RADAR_STREAM_CHAT: streamChat ? "true" : "false",
                         RADAR_KEYWORD_ONLY: keywordOnly ? "true" : "false",
                         RADAR_EXTRA_SOURCES: extraSources.join(","),
+                        RADAR_SEARXNG_URL: searxngUrl.trim(),
+                        RADAR_JINA_READER: jinaReader ? "true" : "false",
                       },
                     })
                   }
@@ -667,8 +692,38 @@ export function SettingsPage() {
 
             {/* External MCP */}
             <div className="rounded-md border border-[var(--border)] bg-[var(--background)] p-4 space-y-3">
-              <div className="flex items-center gap-2 font-semibold">
-                <Server className="h-3.5 w-3.5" /> 外部 stdio MCP 服务
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2 font-semibold">
+                  <Server className="h-3.5 w-3.5" /> 外部 stdio MCP 服务
+                </div>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-[11px] text-[var(--muted-foreground)]">开源预设：</span>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-6 px-2 text-[11px]"
+                    onClick={() => {
+                      setMcpName("fetch")
+                      setMcpCmd("uvx")
+                      setMcpArgs("mcp-server-fetch")
+                    }}
+                  >
+                    + mcp-server-fetch
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-6 px-2 text-[11px]"
+                    onClick={() => {
+                      setMcpName("searxng")
+                      setMcpCmd("npx")
+                      setMcpArgs("-y mcp-searxng")
+                      setMcpEnv("SEARXNG_URL")
+                    }}
+                  >
+                    + mcp-searxng
+                  </Button>
+                </div>
               </div>
               <div className="grid grid-cols-1 gap-2 md:grid-cols-4">
                 <Input placeholder="名称" value={mcpName} onChange={(e) => setMcpName(e.target.value)} />

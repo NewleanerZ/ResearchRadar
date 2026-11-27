@@ -21,6 +21,8 @@ const TOOL_LABELS: Record<string, string> = {
   call_external_mcp: "调用外部 MCP 工具",
   read_artifact: "读取完整产物",
   run_subagent: "并发子代理查证",
+  web_search: "开源全网检索",
+  read_webpage: "读取网页正文",
   fetch_paper_summary: "获取论文网页摘要",
   fetch_paper_pdf: "探索获取原始 PDF",
   set_paper_state: "更新阅读状态",

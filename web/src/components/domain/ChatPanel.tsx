@@ -142,6 +142,40 @@ function ToolEvents({
             </div>
           )
         }
+        if (name === "web_search" && data) {
+          const results = (data.results || []) as any[]
+          return (
+            <div key={idx} className="rounded border border-[var(--border)] bg-[var(--background)] p-2.5 text-xs">
+              <div className="mb-1.5 flex items-center justify-between text-[11px] text-[var(--muted-foreground)]">
+                <span>全网检索（{data.provider === "searxng" ? "SearXNG" : "DuckDuckGo / GitHub / HF"}）· 命中 {data.total || results.length} 条</span>
+              </div>
+              <ol className="space-y-1.5">
+                {results.map((r, ri) => (
+                  <li key={ri} className="border-t border-[var(--border)]/60 pt-1.5 first:border-t-0 first:pt-0">
+                    <a href={r.url} target="_blank" rel="noopener noreferrer" className="font-medium text-[var(--foreground)] hover:text-[var(--accent)] hover:underline">
+                      {ri + 1}. {r.title}
+                    </a>
+                    <div className="text-[10px] text-[var(--muted-foreground)]">{r.source}{r.updated_at ? ` · ${r.updated_at}` : ""}</div>
+                    {r.snippet && <p className="mt-0.5 line-clamp-2 text-[11px] text-[var(--muted-foreground)]">{r.snippet}</p>}
+                  </li>
+                ))}
+              </ol>
+              {artifactFooter}
+            </div>
+          )
+        }
+        if (name === "read_webpage" && data) {
+          return (
+            <div key={idx} className="rounded border border-[var(--border)] bg-[var(--background)] p-2.5 text-xs">
+              <div className="flex items-center justify-between gap-2 text-[11px] text-[var(--muted-foreground)]">
+                <span className="truncate font-medium text-[var(--foreground)]">{data.title || data.url}</span>
+                <span className="shrink-0">{data.extractor} · {data.char_count} 字符</span>
+              </div>
+              {data.content && <p className="mt-1 line-clamp-4 text-[11px] text-[var(--muted-foreground)] whitespace-pre-wrap">{data.content}</p>}
+              {artifactFooter}
+            </div>
+          )
+        }
         if (name === "fetch_paper_summary" && data) {
           return (
             <div key={idx} className="rounded border border-[var(--border)] bg-[var(--background)] p-2.5 text-xs">
