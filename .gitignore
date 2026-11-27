@@ -16,7 +16,9 @@ pytest-cache-files-*/
 *.egg-info/
 /build/
 /dist/
+logs/
 *.spec
+!ResearchRadar.spec
 web/node_modules/
 /web/dist/
 *.tsbuildinfo

@@ -7,8 +7,9 @@ import re
 
 from .models import Settings
 from .ranking import MODEL
+from .runtime_paths import app_dir
 
-ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+ENV_PATH = app_dir() / ".env"
 
 SECRET_SPECS = [
     ("OPENALEX_API_KEY", "OpenAlex API Key", "提升 OpenAlex 检索稳定性和配额"),

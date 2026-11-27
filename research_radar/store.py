@@ -16,6 +16,7 @@ from sqlalchemy import URL, create_engine, event, text
 from sqlalchemy.pool import NullPool
 
 from .models import Record, Topic, backfill_venues, dump, fingerprint, utc_now, venue_matches
+from .runtime_paths import bundle_dir
 from .sources import normalize_doi
 
 
@@ -68,7 +69,10 @@ class Store:
             with self.engine.connect() as con:
                 con.exec_driver_sql("PRAGMA journal_mode = WAL")
             config = Config()
-            config.set_main_option("script_location", str(Path(__file__).parent / "migrations").replace("%", "%%"))
+            migrations_dir = bundle_dir() / "research_radar" / "migrations"
+            if not migrations_dir.exists():
+                migrations_dir = Path(__file__).parent / "migrations"
+            config.set_main_option("script_location", str(migrations_dir).replace("%", "%%"))
             config.attributes["engine"] = self.engine
             command.upgrade(config, "head")
 

@@ -11,6 +11,8 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 
+from .runtime_paths import app_dir, bundle_dir, is_frozen
+
 
 CORE_SOURCES = ("arxiv", "openalex")
 EXTRA_SOURCES = ("crossref", "openreview", "dblp", "acl", "pmlr", "semantic_scholar", "cvf")
@@ -114,7 +116,7 @@ class TopicDraft(BaseModel):
 
 
 class Settings(BaseModel):
-    data_dir: Path = Path("data")
+    data_dir: Path = Field(default_factory=lambda: (app_dir() / "data") if is_frozen() else Path("data"))
     openalex_key: SecretStr = SecretStr("")
     crossref_mailto: str = ""
     extra_sources: str = ",".join(DEFAULT_EXTRA_SOURCES)
@@ -145,7 +147,14 @@ class Settings(BaseModel):
 
     @classmethod
     def from_env(cls):
-        load_dotenv()
+        if is_frozen():
+            env_file = app_dir() / ".env"
+            example = bundle_dir() / ".env.example"
+            if not env_file.exists() and example.exists():
+                env_file.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
+            load_dotenv(dotenv_path=env_file)
+        else:
+            load_dotenv()
         names = {
             "data_dir": "RADAR_DATA_DIR", "openalex_key": "OPENALEX_API_KEY",
             "crossref_mailto": "RADAR_CROSSREF_MAILTO", "extra_sources": "RADAR_EXTRA_SOURCES",
@@ -169,7 +178,13 @@ class Settings(BaseModel):
         return tuple(source for source in EXTRA_SOURCES if source in requested)
 
     def embedding_path(self) -> Path:
-        return self.data_dir.resolve() / "models" / "bge-small-en-v1.5" / self.embedding_revision
+        local = self.data_dir.resolve() / "models" / "bge-small-en-v1.5" / self.embedding_revision
+        if (local / "model.safetensors").exists() or (local / "pytorch_model.bin").exists():
+            return local
+        bundled = bundle_dir() / "models" / "bge-small-en-v1.5" / self.embedding_revision
+        if bundled.exists():
+            return bundled
+        return local
 
     @field_validator("embedding_revision")
     @classmethod

@@ -60,7 +60,9 @@ from .sources import catalog_applies
 from .store import Store, norm, work_date
 from .zotero import pull_zotero_collection, push_favorites_to_zotero
 
-WEB_DIST = Path(__file__).resolve().parent.parent / "web" / "dist"
+from .runtime_paths import bundle_dir
+
+WEB_DIST = bundle_dir() / "web" / "dist"
 LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 NON_SECRET_ENV_KEYS = {
     "RADAR_LLM_BASE_URL", "RADAR_LLM_MODEL", "RADAR_THINKING_LEVEL", "RADAR_STREAM_CHAT",

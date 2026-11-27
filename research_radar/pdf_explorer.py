@@ -17,6 +17,7 @@ import httpx
 
 from .models import Record, Settings, paper_publication, publication_label, utc_now
 from .ranking import best_record
+from .runtime_paths import is_frozen
 from .sources import OPENALEX, arxiv_identifier, normalize_doi, tidy
 from .store import Store, write
 from .v2_sources import SEMANTIC_SCHOLAR
@@ -67,6 +68,25 @@ PDF_HOSTS = {
     "nature.com", "www.nature.com", "journals.plos.org", "pdfs.semanticscholar.org",
     "raw.githubusercontent.com",
 }
+
+def extract_pdf_pages_json(path: str, page_limit: int, text_limit: int) -> str:
+    """Extract PDF page text into JSON (used in-process by frozen subprocess or via PDF_PROGRAM)."""
+    from pypdf import PdfReader
+
+    reader = PdfReader(path)
+    if reader.is_encrypted:
+        raise ValueError("encrypted")
+    count = len(reader.pages)
+    pages = []
+    for index in range(min(count, page_limit)):
+        page = reader.pages[index]
+        stream = page.get_contents()
+        if stream is not None and len(stream.get_data()) > 4 * 1024 * 1024:
+            pages.append("")
+            continue
+        pages.append(" ".join((page.extract_text() or "").split())[:text_limit])
+    return json.dumps({"count": count, "pages": pages}, ensure_ascii=True)
+
 
 PDF_PROGRAM = """
 import json
@@ -249,9 +269,14 @@ def parse_pdf_bytes_ephemeral(raw_bytes: bytes, deadline: float) -> tuple[dict, 
     with TemporaryDirectory(prefix="research-radar-pdf-") as directory:
         path = Path(directory) / "document.pdf"
         path.write_bytes(raw_bytes)
+        cmd = (
+            [sys.executable, "--internal-extract-pdf", str(path), str(MAX_PDF_PAGES), str(MAX_PDF_TEXT_PER_PAGE)]
+            if is_frozen()
+            else [sys.executable, "-B", "-I", "-c", PDF_PROGRAM, str(path), str(MAX_PDF_PAGES), str(MAX_PDF_TEXT_PER_PAGE)]
+        )
         try:
             process = subprocess.run(
-                [sys.executable, "-B", "-I", "-c", PDF_PROGRAM, str(path), str(MAX_PDF_PAGES), str(MAX_PDF_TEXT_PER_PAGE)],
+                cmd,
                 timeout=min(18.0, remaining), check=True, capture_output=True,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )

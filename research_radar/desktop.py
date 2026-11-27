@@ -19,10 +19,11 @@ from PySide6.QtWidgets import (
 
 from .events import list_events
 from .models import Settings
+from .runtime_paths import app_dir, bundle_dir, is_frozen
 from .service import RUN_LABELS, daily_overview, enqueue_daily, open_store
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-PET_IMAGE = Path(__file__).with_name("pet-mascot.png")
+PROJECT_ROOT = app_dir()
+PET_IMAGE = bundle_dir() / "research_radar" / "pet-mascot.png"
 
 STATE_HEX = {
     "queued": "#2563EB",
@@ -195,6 +196,13 @@ class LocalServices:
 
     @staticmethod
     def start(*arguments):
+        if is_frozen():
+            cli_args = arguments[1:] if arguments and arguments[0] == "research_radar.cli" else arguments
+            return subprocess.Popen(
+                [sys.executable, "--cli", *cli_args],
+                cwd=app_dir(),
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
         interpreter = Path(sys.executable)
         if interpreter.name.lower() == "pythonw.exe":
             interpreter = interpreter.with_name("python.exe")
