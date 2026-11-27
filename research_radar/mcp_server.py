@@ -43,10 +43,10 @@ def create_mcp_server(store: Store | None = None, settings: Settings | None = No
     def get_paper_details(topic_id: str, paper_id: int) -> dict:
         """Return paper metadata, abstract, L1 summary card, and cached L2/L3 analysis."""
         topic, _ = db.topic(topic_id)
-        item = next((p for p in library(db, topic) if p["paper_id"] == paper_id), None)
-        if not item:
+        papers = library(db, topic, paper_id=paper_id)
+        if not papers:
             raise ValueError("找不到论文")
-        rec = best_record(item)
+        rec = best_record(papers[0])
         return {
             "paper_id": paper_id, "title": rec.title, "authors": rec.authors,
             "abstract": rec.abstract, "url": rec.url, "card": find_card(db, topic_id, paper_id),
